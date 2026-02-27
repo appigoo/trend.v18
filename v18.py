@@ -191,13 +191,22 @@ def fetch_market_data() -> dict:
     result = {}
     for ticker, (name, key) in MARKET_TICKERS.items():
         try:
-            df = yf.download(ticker, period="5d", interval="1d",
-                             auto_adjust=True, progress=False)
+            t  = yf.Ticker(ticker)
+            df = t.history(period="5d", interval="1d", auto_adjust=True)
             if df.empty:
+                # fallback: try download
+                df = yf.download(ticker, period="5d", interval="1d",
+                                 auto_adjust=True, progress=False)
+                if df.empty:
+                    continue
+                df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+            # normalize columns
+            df.columns = [str(c[0]).strip() if isinstance(c, tuple) else str(c).strip()
+                          for c in df.columns]
+            if "Close" not in df.columns:
                 continue
-            df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
-            last  = float(df["Close"].iloc[-1])
-            prev  = float(df["Close"].iloc[-2]) if len(df) > 1 else last
+            last  = float(df["Close"].dropna().iloc[-1])
+            prev  = float(df["Close"].dropna().iloc[-2]) if len(df["Close"].dropna()) > 1 else last
             chg   = last - prev
             pct   = chg / prev * 100 if prev else 0
             result[key] = {"name": name, "ticker": ticker,
@@ -227,44 +236,90 @@ def get_vix_regime(vix: float) -> tuple:
     return             ("極度恐慌 💀",    "#cc0000", 95)
 
 @st.cache_data(ttl=300)
-def fetch_news(query: str = "US stock market", max_items: int = 8) -> list:
+def fetch_news(max_items: int = 8) -> list:
     """
-    用 Yahoo Finance RSS 抓取財經新聞。
-    回傳 list of dict: {title, link, pubdate, sentiment}
+    多來源財經新聞抓取：
+    1. Google News RSS（最可靠，免費）
+    2. MarketWatch RSS fallback
+    回傳 list of dict: {title, link, date, sentiment}
     """
-    import re, html
-    feeds = [
-        f"https://feeds.finance.yahoo.com/rss/2.0/headline?s=SPY,QQQ,^VIX&region=US&lang=en-US",
-        "https://feeds.finance.yahoo.com/rss/2.0/headline?s=AAPL,TSLA,NVDA&region=US&lang=en-US",
-    ]
-    items = []
-    bear_kw = ["crash","fall","drop","decline","slump","fear","recession",
-               "inflation","rate hike","sell-off","warning","risk","loss","down"]
-    bull_kw = ["rally","surge","gain","rise","record","growth","beat","strong",
-               "upgrade","buy","bull","positive","profit","up"]
+    import re, html as html_lib
 
-    for feed_url in feeds:
-        try:
-            resp = requests.get(feed_url, timeout=6,
-                                headers={"User-Agent": "Mozilla/5.0"})
-            titles = re.findall(r"<title><!\[CDATA\[(.*?)\]\]></title>", resp.text)
-            links  = re.findall(r"<link>(https?://.*?)</link>",           resp.text)
-            dates  = re.findall(r"<pubDate>(.*?)</pubDate>",              resp.text)
-            for i, title in enumerate(titles[1:], 0):  # skip channel title
-                if len(items) >= max_items: break
-                title = html.unescape(title).strip()
-                link  = links[i] if i < len(links) else "#"
-                date  = dates[i] if i < len(dates) else ""
-                tl    = title.lower()
-                if   any(w in tl for w in bear_kw): sent = "bear"
-                elif any(w in tl for w in bull_kw): sent = "bull"
-                else:                                sent = "neu"
-                items.append({"title": title, "link": link,
-                               "date": date[:16], "sentiment": sent})
-        except Exception:
-            pass
+    FEEDS = [
+        ("Google Finance News",
+         "https://news.google.com/rss/search?q=stock+market+wall+street&hl=en-US&gl=US&ceid=US:en"),
+        ("Google Economy News",
+         "https://news.google.com/rss/search?q=fed+interest+rate+inflation+nasdaq&hl=en-US&gl=US&ceid=US:en"),
+        ("MarketWatch",
+         "https://feeds.content.dowjones.io/public/rss/mw_marketpulse"),
+    ]
+    BEAR_KW = ["crash","fall","drop","decline","slump","fear","recession","selloff",
+               "inflation","rate hike","sell-off","warning","risk","loss","tumble",
+               "plunge","weak","concern","worry","tariff","yield surge"]
+    BULL_KW = ["rally","surge","gain","rise","record","growth","beat","strong",
+               "upgrade","buy","bull","positive","profit","rebound","recover",
+               "outperform","soar","climb","boost","optimism"]
+
+    headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                              "AppleWebKit/537.36 (KHTML, like Gecko) "
+                              "Chrome/120.0.0.0 Safari/537.36"}
+    items = []
+
+    for src_name, feed_url in FEEDS:
         if len(items) >= max_items:
             break
+        try:
+            resp = requests.get(feed_url, timeout=8, headers=headers)
+            if resp.status_code != 200:
+                continue
+            text = resp.text
+
+            # Parse <item> blocks
+            item_blocks = re.findall(r"<item>(.*?)</item>", text, re.DOTALL)
+            for block in item_blocks:
+                if len(items) >= max_items:
+                    break
+                # Title
+                t_match = re.search(r"<title>(.*?)</title>", block, re.DOTALL)
+                if not t_match:
+                    continue
+                title = t_match.group(1)
+                title = re.sub(r"<!\[CDATA\[(.*?)\]\]>", r"", title)
+                title = re.sub(r"<[^>]+>", "", title)
+                title = html_lib.unescape(title).strip()
+                if not title or len(title) < 10:
+                    continue
+
+                # Link
+                l_match = re.search(r"<link>(.*?)</link>", block)
+                if not l_match:
+                    l_match = re.search(r"<guid[^>]*>(.*?)</guid>", block)
+                link = l_match.group(1).strip() if l_match else "#"
+
+                # Date
+                d_match = re.search(r"<pubDate>(.*?)</pubDate>", block)
+                raw_date = d_match.group(1).strip() if d_match else ""
+                try:
+                    from email.utils import parsedate_to_datetime
+                    dt = parsedate_to_datetime(raw_date)
+                    date_str = dt.strftime("%m/%d %H:%M")
+                except Exception:
+                    date_str = raw_date[:16]
+
+                # Sentiment
+                tl = title.lower()
+                if   any(w in tl for w in BEAR_KW): sentiment = "bear"
+                elif any(w in tl for w in BULL_KW): sentiment = "bull"
+                else:                                sentiment = "neu"
+
+                items.append({
+                    "title": title, "link": link,
+                    "date": date_str, "sentiment": sentiment,
+                    "source": src_name,
+                })
+        except Exception:
+            continue
+
     return items
 
 def calc_sentiment_score(mkt: dict, vix_hist: pd.Series) -> dict:
@@ -399,53 +454,66 @@ def render_market_environment():
             bond_score = max(0, min(100, 50 - tnx_pct*6))
             indicators.append(("債券安全", bond_score, "#44ccff"))
 
-        meter_rows = ""
-        for name, val, color in indicators:
-            val = max(0, min(100, val))
-            meter_rows += f"""
-            <div class="sentiment-meter">
-              <span class="sentiment-label">{name}</span>
-              <div class="sentiment-bar-bg">
-                <div class="sentiment-bar-fill" style="width:{val:.0f}%;background:{color};"></div>
-              </div>
-              <span class="sentiment-val" style="color:{color}">{val:.0f}</span>
-            </div>"""
+        # 建立情緒分項 HTML（不使用縮排，避免 Streamlit 把空白當 code block）
+        meter_parts = []
+        for ind_name, ind_val, ind_color in indicators:
+            ind_val = max(0, min(100, ind_val))
+            meter_parts.append(
+                f'<div class="sentiment-meter">'
+                f'<span class="sentiment-label">{ind_name}</span>'
+                f'<div class="sentiment-bar-bg">'
+                f'<div class="sentiment-bar-fill" style="width:{ind_val:.0f}%;background:{ind_color};"></div>'
+                f'</div>'
+                f'<span class="sentiment-val" style="color:{ind_color}">{ind_val:.0f}</span>'
+                f'</div>'
+            )
+        meter_rows = "".join(meter_parts)
 
-        st.markdown(f"""
-        <div class="mkt-panel">
-          <div class="mkt-title">🧠 投資人情緒指數</div>
-          <div style="font-size:1.8rem;font-weight:800;color:{sc_color};margin-bottom:4px;">
-            {sc:.0f} <span style="font-size:0.9rem">{sent['label']}</span>
-          </div>
-          <div class="vix-bar-bg" style="height:12px;margin-bottom:10px;">
-            <div class="vix-bar-fill" style="width:{sc:.0f}%;background:linear-gradient(90deg,#ff4444,#ffcc00,#00ee66);"></div>
-          </div>
-          {meter_rows}
-          <div style="font-size:0.68rem;color:#445566;margin-top:6px;">
-            綜合 VIX壓力(40%) + SPY動能(30%) + QQQ動能(30%)
-          </div>
-        </div>
-        """, unsafe_allow_html=True)
+        gradient = "linear-gradient(90deg,#ff4444 0%,#ffcc00 50%,#00ee66 100%)"
+        sent_html = (
+            f'<div class="mkt-panel">'
+            f'<div class="mkt-title">🧠 投資人情緒指數</div>'
+            f'<div style="font-size:1.8rem;font-weight:800;color:{sc_color};margin-bottom:4px;">'
+            f'{sc:.0f} <span style="font-size:0.9rem">{sent["label"]}</span>'
+            f'</div>'
+            f'<div class="vix-bar-bg" style="height:12px;margin-bottom:10px;">'
+            f'<div class="vix-bar-fill" style="width:{sc:.0f}%;background:{gradient};"></div>'
+            f'</div>'
+            f'{meter_rows}'
+            f'<div style="font-size:0.68rem;color:#445566;margin-top:6px;">'
+            f'綜合 VIX壓力(40%) + SPY動能(30%) + QQQ動能(30%)'
+            f'</div>'
+            f'</div>'
+        )
+        st.markdown(sent_html, unsafe_allow_html=True)
 
     with col_news_hd:
-        st.markdown('<div class="mkt-panel"><div class="mkt-title">📰 即時財經新聞</div>',
-                    unsafe_allow_html=True)
         news = fetch_news()
+        icons = {"bull": "🟢", "bear": "🔴", "neu": "⚪"}
         if news:
-            news_html = ""
-            icons = {"bull": "🟢", "bear": "🔴", "neu": "⚪"}
+            news_parts = ['<div class="mkt-panel"><div class="mkt-title">📰 即時財經新聞</div>']
             for n in news:
                 icon = icons.get(n["sentiment"], "⚪")
-                cls  = f"news-{n['sentiment']}"
-                news_html += f"""
-                <div class="news-item {cls}">
-                  {icon} <a href="{n['link']}" target="_blank"
-                     style="color:#ccd6ee;text-decoration:none;">{n['title']}</a>
-                  <div class="news-src">{n['date']}</div>
-                </div>"""
-            st.markdown(news_html + "</div>", unsafe_allow_html=True)
+                cls  = "news-" + n["sentiment"]
+                src  = n.get("source", "")
+                news_parts.append(
+                    f'<div class="news-item {cls}">'
+                    f'{icon} <a href="{n["link"]}" target="_blank" '
+                    f'style="color:#ccd6ee;text-decoration:none;">{n["title"]}</a>'
+                    f'<div class="news-src">{n["date"]}　{src}</div>'
+                    f'</div>'
+                )
+            news_parts.append('</div>')
+            st.markdown("".join(news_parts), unsafe_allow_html=True)
         else:
-            st.markdown("新聞載入中，請稍候…</div>", unsafe_allow_html=True)
+            st.markdown(
+                '<div class="mkt-panel">'
+                '<div class="mkt-title">📰 即時財經新聞</div>'
+                '<div style="color:#556688;font-size:0.85rem;padding:8px 0;">'
+                '⚠️ 新聞暫時無法載入（網路限制），請稍後重試'
+                '</div></div>',
+                unsafe_allow_html=True
+            )
 
     # ── 第三行：市場環境警示 ──────────────────────────────────────────────
     mkt_alerts = []
