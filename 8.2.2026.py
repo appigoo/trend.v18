@@ -1,1767 +1,1175 @@
 import streamlit as st
 import yfinance as yf
 import pandas as pd
-from datetime import datetime
-import time
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-from dotenv import load_dotenv
-import os
-import plotly.express as px
+import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+from datetime import datetime
+import time
 import requests
-import numpy as np  # 新增：用于OBV中的np.sign
 
-st.set_page_config(page_title="股票監控儀表板", layout="wide")
+# ══════════════════════════════════════════════════════════════════════════════
+# 頁面設定
+# ══════════════════════════════════════════════════════════════════════════════
+st.set_page_config(
+    page_title="美股即時監控系統",
+    page_icon="📈",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
-load_dotenv()
-# 异动阈值设定
-REFRESH_INTERVAL = 144  # 秒，5 分钟自动刷新
+# ══════════════════════════════════════════════════════════════════════════════
+# CSS
+# ══════════════════════════════════════════════════════════════════════════════
+st.markdown("""
+<style>
+    .block-container { padding-top: 1rem; }
 
-# Gmail 发信者帐号设置
-SENDER_EMAIL = os.getenv("SENDER_EMAIL")
-SENDER_PASSWORD = os.getenv("SENDER_PASSWORD")
-RECIPIENT_EMAIL = os.getenv("RECIPIENT_EMAIL")
+    /* Metric 卡片 */
+    [data-testid="stMetric"] {
+        background: #1e2235; border-radius: 10px;
+        padding: 12px 14px; border: 1px solid #2e3456;
+    }
+    [data-testid="stMetricLabel"] > div {
+        font-size: 0.9rem !important; color: #aab4cc !important;
+        font-weight: 600; letter-spacing: 0.03em;
+    }
+    [data-testid="stMetricValue"] > div {
+        font-size: 1.55rem !important; color: #ffffff !important; font-weight: 700;
+    }
+    [data-testid="stMetricDelta"] > div { font-size: 0.9rem !important; font-weight: 600; }
 
-# ==================== Telegram 設定與函數 (保持不變) ====================
-try:
-    # 假設 secrets.toml 已經設定
-    BOT_TOKEN = st.secrets["telegram"]["BOT_TOKEN"]
-    CHAT_ID = st.secrets["telegram"]["CHAT_ID"]
-    telegram_ready = True
-except Exception:
-    BOT_TOKEN = CHAT_ID = None
-    telegram_ready = False
-    # st.sidebar.error("Telegram 設定錯誤，請檢查 secrets.toml") # 避免過度提醒
+    /* EMA 數值列 */
+    .ema-bar {
+        background: #151825; border-radius: 8px; padding: 9px 14px;
+        margin: 6px 0 8px 0; display: flex; flex-wrap: wrap;
+        gap: 12px; border: 1px solid #252840;
+    }
+    .ema-item { font-size: 0.9rem; font-weight: 600; white-space: nowrap; }
+    .ema-label { opacity: 0.7; font-size: 0.78rem; }
 
-def send_telegram_alert(msg: str) -> bool:
-    if not (BOT_TOKEN and CHAT_ID):
-        return False
-    # ... (Telegram 發送邏輯，保持不變)
-    try:
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-        payload = {
-            "chat_id": CHAT_ID,
-            "text": msg,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True
-        }
-        response = requests.get(url, params=payload, timeout=10)
-        if response.status_code == 200 and response.json().get("ok"):
-            return True
-        else:
-            # st.warning(f"Telegram API 錯誤: {response.json()}")
-            return False
-    except Exception as e:
-        # st.warning(f"Telegram 發送失敗: {e}")
-        return False
+    /* 趨勢卡片 */
+    .trend-card {
+        background: #1e2235; border-radius: 10px;
+        padding: 12px 14px; border: 1px solid #2e3456; text-align: center;
+    }
+    .trend-title { font-size: 0.9rem; color: #aab4cc; font-weight: 600; margin-bottom: 4px; }
+    .trend-bull  { color: #00ee66; font-weight: 800; font-size: 1.45rem; }
+    .trend-bear  { color: #ff4455; font-weight: 800; font-size: 1.45rem; }
+    .trend-side  { color: #ffcc00; font-weight: 800; font-size: 1.45rem; }
 
-# MACD 计算函数
-def calculate_macd(data, fast=12, slow=26, signal=9):
-    exp1 = data["Close"].ewm(span=fast, adjust=False).mean()
-    exp2 = data["Close"].ewm(span=slow, adjust=False).mean()
-    macd = exp1 - exp2
-    signal_line = macd.ewm(span=signal, adjust=False).mean()
-    histogram = macd - signal_line
-    return macd, signal_line, histogram
+    /* 多週期摘要列 */
+    .mtf-header {
+        background: #151825; border-radius: 10px; padding: 10px 16px;
+        margin: 4px 0; border: 1px solid #252840;
+        display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+    }
+    .mtf-period { font-size: 0.85rem; color: #aab4cc; font-weight: 700; min-width: 52px; }
+    .mtf-price  { font-size: 1.05rem; color: #ffffff; font-weight: 700; }
+    .mtf-chg-up { font-size: 0.88rem; color: #00ee66; font-weight: 600; }
+    .mtf-chg-dn { font-size: 0.88rem; color: #ff4455; font-weight: 600; }
+    .mtf-trend-bull { background:#0d2e18; color:#00ee66; border-radius:4px; padding:2px 8px; font-size:0.82rem; font-weight:700; }
+    .mtf-trend-bear { background:#2e0d0d; color:#ff4455; border-radius:4px; padding:2px 8px; font-size:0.82rem; font-weight:700; }
+    .mtf-trend-side { background:#28260d; color:#ffcc00; border-radius:4px; padding:2px 8px; font-size:0.82rem; font-weight:700; }
+    .mtf-macd-bull  { color:#00ee66; font-size:0.82rem; }
+    .mtf-macd-bear  { color:#ff4455; font-size:0.82rem; }
+    .mtf-ema-bull   { color:#00ee66; font-size:0.82rem; }
+    .mtf-ema-bear   { color:#ff4455; font-size:0.82rem; }
+    .mtf-divider    { height:28px; width:1px; background:#2e3456; flex-shrink:0; }
 
-# RSI 计算函数
-def calculate_rsi(data, periods=14):
-    delta = data["Close"].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=periods).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=periods).mean()
-    rs = gain / loss
-    rsi = 100 - (100 / (1 + rs))
-    return rsi
+    /* 區塊標題 */
+    .mtf-section-title {
+        font-size: 1.1rem; font-weight: 700; color: #ddeeff;
+        padding: 8px 0 4px 0; border-bottom: 2px solid #2e3456;
+        margin: 14px 0 8px 0;
+    }
 
-# 新增：VWAP 计算函数
-def calculate_vwap(data):
-    typical_price = (data['High'] + data['Low'] + data['Close']) / 3
-    vwap = (typical_price * data['Volume']).cumsum() / data['Volume'].cumsum()
-    return vwap
+    /* 警示面板 */
+    .alert-box {
+        padding: 11px 16px; border-radius: 8px; margin: 4px 0;
+        font-size: 0.92rem; font-weight: 500; line-height: 1.5;
+    }
+    .alert-bull { background:#0d2e18; border-left:5px solid #00ee66; color:#88ffbb; }
+    .alert-bear { background:#2e0d0d; border-left:5px solid #ff4455; color:#ffaaaa; }
+    .alert-vol  { background:#0d1e38; border-left:5px solid #44aaff; color:#aaddff; }
+    .alert-info { background:#28260d; border-left:5px solid #ffcc00; color:#fff0aa; }
 
-# 新增：MFI 计算函数
-def calculate_mfi(data, periods=14):
-    typical_price = (data['High'] + data['Low'] + data['Close']) / 3
-    money_flow = typical_price * data['Volume']
-    positive_flow = money_flow.where(typical_price > typical_price.shift(1), 0).rolling(window=periods).sum()
-    negative_flow = money_flow.where(typical_price < typical_price.shift(1), 0).rolling(window=periods).sum()
-    money_ratio = positive_flow / negative_flow
-    mfi = 100 - (100 / (1 + money_ratio))
-    return mfi
+    /* 市場環境面板 */
+    .mkt-panel {
+        background: #12151f; border-radius: 12px; padding: 14px 18px;
+        border: 1px solid #2a2e48; margin-bottom: 10px;
+    }
+    .mkt-title {
+        font-size: 1rem; font-weight: 700; color: #99aacc;
+        letter-spacing: 0.05em; margin-bottom: 10px;
+        border-bottom: 1px solid #2a2e48; padding-bottom: 6px;
+    }
+    .mkt-row { display:flex; flex-wrap:wrap; gap:10px; margin-bottom:6px; }
+    .mkt-card {
+        background:#1a1e2e; border-radius:8px; padding:8px 14px;
+        border:1px solid #252840; flex:1; min-width:100px; text-align:center;
+    }
+    .mkt-card-label { font-size:0.72rem; color:#7788aa; margin-bottom:2px; }
+    .mkt-card-val   { font-size:1.05rem; font-weight:700; color:#eef2ff; }
+    .mkt-card-chg-up { font-size:0.78rem; color:#00ee66; }
+    .mkt-card-chg-dn { font-size:0.78rem; color:#ff4455; }
+    .mkt-card-neu    { font-size:0.78rem; color:#ffcc00; }
 
-# 新增：OBV 计算函数
-def calculate_obv(data):
-    obv = (np.sign(data['Close'].diff()) * data['Volume']).fillna(0).cumsum()
-    return obv
-###add
-# 新增：簡易成交密集區（Volume Profile）計算
-def calculate_volume_profile_dense_areas(data, bins=50, window=100, top_n=3):
-    """
-    計算最近 window 根 K 線的成交量分佈，找出 top_n 個成交最密集的價格區間
-    返回：list of (價格中點, 總成交量, 區間下限, 區間上限)
-    """
-    if len(data) < window:
-        return []
-    
-    recent = data.tail(window).copy()
-    price_min = recent['Low'].min()
-    price_max = recent['High'].max()
-    
-    # 建立價格 bin
-    bin_edges = np.linspace(price_min, price_max, bins + 1)
-    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
-    
-    # 每個K線的價格範圍分配到 bin
-    volume_profile = np.zeros(bins)
-    
-    for i in range(len(recent)):
-        low = recent['Low'].iloc[i]
-        high = recent['High'].iloc[i]
-        vol = recent['Volume'].iloc[i]
-        
-        # 簡化：均分成交量到 low ~ high 之間的 bin
-        indices = np.digitize([low, high], bin_edges) - 1
-        if indices[0] == indices[1]:
-            # 整個K線在同一 bin
-            if 0 <= indices[0] < bins:
-                volume_profile[indices[0]] += vol
-        else:
-            # 跨多個 bin，均分
-            num_bins = indices[1] - indices[0] + 1
-            if num_bins > 0:
-                vol_per_bin = vol / num_bins
-                for j in range(indices[0], indices[1] + 1):
-                    if 0 <= j < bins:
-                        volume_profile[j] += vol_per_bin
-    
-    # 排序找出 top N
-    top_indices = np.argsort(volume_profile)[-top_n:][::-1]
-    dense_areas = []
-    for idx in top_indices:
-        vol = volume_profile[idx]
-        if vol > 0:
-            dense_areas.append({
-                'price_center': bin_centers[idx],
-                'volume': vol,
-                'price_low': bin_edges[idx],
-                'price_high': bin_edges[idx + 1]
-            })
-    
-    return dense_areas
-    
-# 新增：VIX 获取函数
-def get_vix_data(period, interval):
-    vix_ticker = yf.Ticker("^VIX")
-    vix_data = vix_ticker.history(period=period, interval=interval).reset_index()
-    if "Date" in vix_data.columns:
-        vix_data = vix_data.rename(columns={"Date": "Datetime"})
-    vix_data["VIX Change %"] = vix_data["Close"].pct_change().round(4) * 100
-    return vix_data
+    /* VIX 壓力計 */
+    .vix-bar-bg  { background:#1a1e2e; border-radius:6px; height:10px; margin:4px 0; overflow:hidden; }
+    .vix-bar-fill{ height:100%; border-radius:6px; transition:width 0.4s; }
 
-# 新增：VIX 趨勢計算（EMA交叉）
-def calculate_vix_trend(vix_data, fast=5, slow=10):
-    vix_ema_fast = vix_data["Close"].ewm(span=fast, adjust=False).mean()
-    vix_ema_slow = vix_data["Close"].ewm(span=slow, adjust=False).mean()
-    return vix_ema_fast, vix_ema_slow
+    /* 情緒儀表 */
+    .sentiment-meter {
+        display:flex; align-items:center; gap:8px; margin:6px 0;
+    }
+    .sentiment-label { font-size:0.78rem; color:#7788aa; min-width:52px; }
+    .sentiment-bar-bg { flex:1; background:#1a1e2e; border-radius:4px; height:8px; overflow:hidden; }
+    .sentiment-bar-fill { height:100%; border-radius:4px; }
+    .sentiment-val { font-size:0.78rem; font-weight:700; min-width:40px; text-align:right; }
 
-# 计算所有信号的成功率
-def calculate_signal_success_rate(data):
-    data["Next_Close_Higher"] = data["Close"].shift(-1) > data["Close"]
-    data["Next_Close_Lower"] = data["Close"].shift(-1) < data["Close"]
-    data["Next_High_Higher"] = data["High"].shift(-1) > data["High"]
-    data["Next_Low_Lower"] = data["Low"].shift(-1) < data["Low"]
-    
-    sell_signals = [
-        "📉 High<Low", "📉 MACD賣出", "📉 EMA賣出", "📉 價格趨勢賣出", "📉 價格趨勢賣出(量)", 
-        "📉 價格趨勢賣出(量%)", "📉 普通跳空(下)", "📉 突破跳空(下)", "📉 持續跳空(下)", 
-        "📉 衰竭跳空(下)", "📉 連續向下賣出", "📉 SMA50下降趨勢", "📉 SMA50_200下降趨勢", 
-        "📉 新卖出信号", "📉 RSI-MACD Overbought Crossover", "📉 EMA-SMA Downtrend Sell", 
-        "📉 Volume-MACD Sell", "📉 EMA10_30賣出", "📉 EMA10_30_40強烈賣出", "📉 看跌吞沒", 
-        "📉 上吊線", "📉 黃昏之星", "📉 VWAP賣出", "📉 MFI熊背離賣出", "📉 OBV量能確認賣出",
-        "📉 VIX恐慌賣出", "📉 VIX上升趨勢賣出"
-    ]
-    
-    all_signals = set()
-    for signals in data["異動標記"].dropna():
-        for signal in signals.split(", "):
-            if signal:
-                all_signals.add(signal)
-    
-    success_rates = {}
-    for signal in all_signals:
-        signal_rows = data[data["異動標記"].str.contains(signal, na=False)]
-        total_signals = len(signal_rows)
-        if total_signals == 0:
-            success_rates[signal] = {"success_rate": 0.0, "total_signals": 0, "direction": "up" if signal not in sell_signals else "down"}
-        else:
-            if signal in sell_signals:
-                success_count = (signal_rows["Next_Low_Lower"] & signal_rows["Next_Close_Lower"]).sum() if not signal_rows.empty else 0
-                success_rates[signal] = {
-                    "success_rate": (success_count / total_signals) * 100,
-                    "total_signals": total_signals,
-                    "direction": "down"
-                }
-            else:
-                success_count = (signal_rows["Next_High_Higher"] & signal_rows["Next_Close_Higher"]).sum() if not signal_rows.empty else 0
-                success_rates[signal] = {
-                    "success_rate": (success_count / total_signals) * 100,
-                    "total_signals": total_signals,
-                    "direction": "up"
-                }
-    
-    return success_rates
+    /* 新聞條目 */
+    .news-item {
+        padding: 8px 12px; background:#141824; border-radius:7px;
+        margin:4px 0; border-left:3px solid #2a3060;
+        font-size:0.82rem; line-height:1.5;
+    }
+    .news-item:hover { border-left-color:#4466cc; background:#171d2e; }
+    .news-src  { font-size:0.7rem; color:#556688; margin-top:2px; }
+    .news-bull { border-left-color:#00cc55; }
+    .news-bear { border-left-color:#cc3344; }
+    .news-neu  { border-left-color:#446688; }
+</style>
+""", unsafe_allow_html=True)
 
-# 邮件发送函数（新增参数）
-def send_email_alert(ticker, price_pct, volume_pct, low_high_signal=False, high_low_signal=False, 
-                     macd_buy_signal=False, macd_sell_signal=False, ema_buy_signal=False, ema_sell_signal=False,
-                     price_trend_buy_signal=False, price_trend_sell_signal=False,
-                     price_trend_vol_buy_signal=False, price_trend_vol_sell_signal=False,
-                     price_trend_vol_pct_buy_signal=False, price_trend_vol_pct_sell_signal=False,
-                     gap_common_up=False, gap_common_down=False, gap_breakaway_up=False, gap_breakaway_down=False,
-                     gap_runaway_up=False, gap_runaway_down=False, gap_exhaustion_up=False, gap_exhaustion_down=False,
-                     continuous_up_buy_signal=False, continuous_down_sell_signal=False,
-                     sma50_up_trend=False, sma50_down_trend=False,
-                     sma50_200_up_trend=False, sma50_200_down_trend=False,
-                     new_buy_signal=False, new_sell_signal=False, new_pivot_signal=False,
-                     ema10_30_buy_signal=False, ema10_30_40_strong_buy_signal=False,
-                     ema10_30_sell_signal=False, ema10_30_40_strong_sell_signal=False,
-                     bullish_engulfing=False, bearish_engulfing=False, hammer=False, hanging_man=False,
-                     morning_star=False, evening_star=False,
-                     # 新增参数
-                     vwap_buy_signal=False, vwap_sell_signal=False,
-                     mfi_bull_divergence=False, mfi_bear_divergence=False,
-                     obv_breakout_buy=False, obv_breakout_sell=False,
-                     # 新增 VIX 参数
-                     vix_panic_sell=False, vix_calm_buy=False,
-                     # 新增 VIX 趨勢参数
-                     vix_uptrend_sell=False, vix_downtrend_buy=False):
-    subject = f"📣 股票異動通知：{ticker}"
-    body = f"""
-    股票代號：{ticker}
-    股價變動：{price_pct:.2f}%
-    成交量變動：{volume_pct:.2f}%
-    """
-    if low_high_signal:
-        body += f"\n⚠️ 當前最低價高於前一時段最高價！"
-    if high_low_signal:
-        body += f"\n⚠️ 當前最高價低於前一時段最低價！"
-    if macd_buy_signal:
-        body += f"\n📈 MACD 買入訊號：MACD 線由負轉正！"
-    if macd_sell_signal:
-        body += f"\n📉 MACD 賣出訊號：MACD 線由正轉負！"
-    if ema_buy_signal:
-        body += f"\n📈 EMA 買入訊號：EMA5 上穿 EMA10，成交量放大！"
-    if ema_sell_signal:
-        body += f"\n📉 EMA 賣出訊號：EMA5 下破 EMA10，成交量放大！"
-    if price_trend_buy_signal:
-        body += f"\n📈 價格趨勢買入訊號：最高價、最低價、收盤價均上漲！"
-    if price_trend_sell_signal:
-        body += f"\n📉 價格趨勢賣出訊號：最高價、最低價、收盤價均下跌！"
-    if price_trend_vol_buy_signal:
-        body += f"\n📈 價格趨勢買入訊號（量）：最高價、最低價、收盤價均上漲且成交量放大！"
-    if price_trend_vol_sell_signal:
-        body += f"\n📉 價格趨勢賣出訊號（量）：最高價、最低價、收盤價均下跌且成交量放大！"
-    if price_trend_vol_pct_buy_signal:
-        body += f"\n📈 價格趨勢買入訊號（量%）：最高價、最低價、收盤價均上漲且成交量變化 > 15%！"
-    if price_trend_vol_pct_sell_signal:
-        body += f"\n📉 價格趨勢賣出訊號（量%）：最高價、最低價、收盤價均下跌且成交量變化 > 15%！"
-    if gap_common_up:
-        body += f"\n📈 普通跳空(上)：價格向上跳空，未伴隨明顯趨勢或成交量放大！"
-    if gap_common_down:
-        body += f"\n📉 普通跳空(下)：價格向下跳空，未伴隨明顯趨勢或成交量放大！"
-    if gap_breakaway_up:
-        body += f"\n📈 突破跳空(上)：價格向上跳空，突破前高且成交量放大！"
-    if gap_breakaway_down:
-        body += f"\n📉 突破跳空(下)：價格向下跳空，跌破前低且成交量放大！"
-    if gap_runaway_up:
-        body += f"\n📈 持續跳空(上)：價格向上跳空，處於上漲趨勢且成交量放大！"
-    if gap_runaway_down:
-        body += f"\n📉 持續跳空(下)：價格向下跳空，處於下跌趨勢且成交量放大！"
-    if gap_exhaustion_up:
-        body += f"\n📈 衰竭跳空(上)：價格向上跳空，趨勢末端且隨後價格下跌，成交量放大！"
-    if gap_exhaustion_down:
-        body += f"\n📉 衰竭跳空(下)：價格向下跳空，趨勢末端且隨後價格上漲，成交量放大！"
-    if continuous_up_buy_signal:
-        body += f"\n📈 連續向上策略買入訊號：至少連續上漲！"
-    if continuous_down_sell_signal:
-        body += f"\n📉 連續向下策略賣出訊號：至少連續下跌！"
-    if sma50_up_trend:
-        body += f"\n📈 SMA50 上升趨勢：當前價格高於 SMA50！"
-    if sma50_down_trend:
-        body += f"\n📉 SMA50 下降趨勢：當前價格低於 SMA50！"
-    if sma50_200_up_trend:
-        body += f"\n📈 SMA50_200 上升趨勢：當前價格高於 SMA50 且 SMA50 高於 SMA200！"
-    if sma50_200_down_trend:
-        body += f"\n📉 SMA50_200 下降趨勢：當前價格低於 SMA50 且 SMA50 低於 SMA200！"
-    if new_buy_signal:
-        body += f"\n📈 新买入信号：今日收盘价大于开盘价且今日开盘价大于前日收盘价！"
-    if new_sell_signal:
-        body += f"\n📉 新卖出信号：今日收盘价小于开盘价且今日开盘价小于前日收盘价！"
-    if new_pivot_signal:
-        body += f"\n🔄 新转折点：|Price Change %| > {PRICE_CHANGE_THRESHOLD}% 且 |Volume Change %| > {VOLUME_CHANGE_THRESHOLD}%！"
-    if ema10_30_buy_signal:
-        body += f"\n📈 EMA10_30 買入訊號：EMA10 上穿 EMA30！"
-    if ema10_30_40_strong_buy_signal:
-        body += f"\n📈 EMA10_30_40 強烈買入訊號：EMA10 上穿 EMA30 且高於 EMA40！"
-    if ema10_30_sell_signal:
-        body += f"\n📉 EMA10_30 賣出訊號：EMA10 下破 EMA30！"
-    if ema10_30_40_strong_sell_signal:
-        body += f"\n📉 EMA10_30_40 強烈賣出訊號：EMA10 下破 EMA30 且低於 EMA40！"
-    if bullish_engulfing:
-        body += f"\n📈 看漲吞沒形態：當前K線完全包圍前一根看跌K線，成交量放大！"
-    if bearish_engulfing:
-        body += f"\n📉 看跌吞沒形態：當前K線完全包圍前一根看漲K線，成交量放大！"
-    if hammer:
-        body += f"\n📈 錘頭線：下影線較長，買方介入，預示反轉！"
-    if hanging_man:
-        body += f"\n📉 上吊線：下影線較長，賣方介入，預示反轉！"
-    if morning_star:
-        body += f"\n📈 早晨之星：下跌後出現小實體K線，隨後強烈看漲K線，預示反轉！"
-    if evening_star:
-        body += f"\n📉 黃昏之星：上漲後出現小實體K線，隨後強烈看跌K線，預示反轉！"
-    # 新增：VWAP、MFI、OBV 描述
-    if vwap_buy_signal:
-        body += f"\n📈 VWAP 買入訊號：價格上穿 VWAP，作為主進場基準！"
-    if vwap_sell_signal:
-        body += f"\n📉 VWAP 賣出訊號：價格下破 VWAP，作為主出場基準！"
-    if mfi_bull_divergence:
-        body += f"\n📈 MFI 牛背離買入：價格新低但 MFI 未新低，偵測超賣背離！"
-    if mfi_bear_divergence:
-        body += f"\n📉 MFI 熊背離賣出：價格新高但 MFI 未新高，偵測超買背離！"
-    if obv_breakout_buy:
-        body += f"\n📈 OBV 突破買入：OBV 新高確認價格上漲量能！"
-    if obv_breakout_sell:
-        body += f"\n📉 OBV 突破賣出：OBV 新低確認價格下跌量能！"
-    # 新增：VIX 描述
-    if vix_panic_sell:
-        body += f"\n📉 VIX 恐慌賣出訊號：VIX > 30 且上升，市場恐慌加劇！"
-    if vix_calm_buy:
-        body += f"\n📈 VIX 平靜買入訊號：VIX < 20 且下降，市場穩定！"
-    # 新增：VIX 趨勢描述
-    if vix_uptrend_sell:
-        body += f"\n📉 VIX 上升趨勢賣出訊號：VIX EMA5 上穿 EMA10，恐慌增加，建議減持！"
-    if vix_downtrend_buy:
-        body += f"\n📈 VIX 下降趨勢買入訊號：VIX EMA5 下破 EMA10，市場平靜，適合進場！"
-    
-    body += "\n系統偵測到異常變動，請立即查看市場情況。"
-    msg = MIMEMultipart()
-    msg["From"] = SENDER_EMAIL
-    msg["To"] = RECIPIENT_EMAIL
-    msg["Subject"] = subject
-    msg.attach(MIMEText(body, "plain"))
+# ══════════════════════════════════════════════════════════════════════════════
+# 常數
+# ══════════════════════════════════════════════════════════════════════════════
+INTERVAL_MAP = {
+    "1m":  ("1分鐘",  "1d"),
+    "5m":  ("5分鐘",  "5d"),
+    "15m": ("15分鐘", "10d"),
+    "30m": ("30分鐘", "30d"),
+    "1d":  ("日K",    "1y"),
+    "1wk": ("週K",    "3y"),
+    "1mo": ("月K",    "5y"),
+}
+ALL_INTERVALS   = list(INTERVAL_MAP.keys())
+INTERVAL_LABELS = {k: v[0] for k, v in INTERVAL_MAP.items()}
 
-    try:
-        server = smtplib.SMTP_SSL("smtp.gmail.com", 465)
-        server.login(SENDER_EMAIL, SENDER_PASSWORD)
-        server.sendmail(SENDER_EMAIL, RECIPIENT_EMAIL, msg.as_string())
-        server.quit()
-        st.toast(f"📬 Email 已發送給 {RECIPIENT_EMAIL}")
-    except Exception as e:
-        st.error(f"Email 發送失敗：{e}")
-
-# UI 设定
-period_options = ["1d", "5d", "1mo", "3mo", "6mo", "1y", "2y", "5y", "10y", "ytd", "max"]
-interval_options = ["1m", "5m", "2m", "15m", "30m", "60m", "90m", "1h", "1d", "5d", "1wk", "1mo", "3mo"]
-percentile_options = [1, 5, 10, 20]
-refresh_options = [30, 60, 90, 144, 150, 180, 210, 240, 270, 300]
-
-st.title("📊 股票監控儀表板（含異動提醒與 Email 通知 ✅）")
-input_tickers = st.text_input("請輸入股票代號（逗號分隔）", value="TSLA, NIO, TSLL, XPEV, META, GOOGL, AAPL, NVDA, AMZN, MSFT, TSM")
-selected_tickers = [t.strip().upper() for t in input_tickers.split(",") if t.strip()]
-selected_period = st.selectbox("選擇時間範圍", period_options, index=5)
-selected_interval = st.selectbox("選擇資料間隔", interval_options, index=8)
-HIGH_N_HIGH_THRESHOLD = st.number_input("Close to high", min_value=0.1, max_value=1.0, value=0.9, step=0.1)
-LOW_N_LOW_THRESHOLD = st.number_input("Close to low", min_value=0.1, max_value=1.0, value=0.9, step=0.1)
-PRICE_THRESHOLD = st.number_input("價格異動閾值 (%)", min_value=0.1, max_value=200.0, value=80.0, step=0.1)
-VOLUME_THRESHOLD = st.number_input("成交量異動閾值 (%)", min_value=0.1, max_value=200.0, value=80.0, step=0.1)
-PRICE_CHANGE_THRESHOLD = st.number_input("新转折点 Price Change % 阈值 (%)", min_value=0.1, max_value=200.0, value=5.0, step=0.1)
-VOLUME_CHANGE_THRESHOLD = st.number_input("新转折点 Volume Change % 阈值 (%)", min_value=0.1, max_value=200.0, value=10.0, step=0.1)
-GAP_THRESHOLD = st.number_input("跳空幅度閾值 (%)", min_value=0.1, max_value=50.0, value=1.0, step=0.1)
-CONTINUOUS_UP_THRESHOLD = st.number_input("連續上漲閾值 (根K線)", min_value=1, max_value=20, value=3, step=1)
-CONTINUOUS_DOWN_THRESHOLD = st.number_input("連續下跌閾值 (根K線)", min_value=1, max_value=20, value=3, step=1)
-PERCENTILE_THRESHOLD = st.selectbox("選擇 Price Change %、Volume Change %、Volume、股價漲跌幅 (%)、成交量變動幅 (%) 數據範圍 (%)", percentile_options, index=1)
-REFRESH_INTERVAL = st.selectbox("选择刷新间隔 (秒)", refresh_options, index=refresh_options.index(300))
-time.sleep(2)
-#
-all_signal_types = [
-    "📉 High<Low", "📉 MACD賣出", "📉 EMA賣出", "📉 價格趨勢賣出", "📉 價格趨勢賣出(量)", 
-        "📉 價格趨勢賣出(量%)", "📉 普通跳空(下)", "📉 突破跳空(下)", "📉 持續跳空(下)", 
-        "📉 衰竭跳空(下)", "📉 連續向下賣出", "📉 SMA50下降趨勢", "📉 SMA50_200下降趨勢", 
-        "📉 新卖出信号", "📉 RSI-MACD Overbought Crossover", "📉 EMA-SMA Downtrend Sell", 
-        "📉 Volume-MACD Sell", "📉 EMA10_30賣出", "📉 EMA10_30_40強烈賣出", "📉 看跌吞沒", "📉 烏雲蓋頂",
-        "📉 上吊線", "📉 黃昏之星","📈 Low>High", "📈 MACD買入", "📈 EMA買入", "📈 價格趨勢買入", "📈 價格趨勢買入(量)", 
-        "📈 價格趨勢買入(量%)", "📈 普通跳空(上)", "📈 突破跳空(上)", "📈 持續跳空(上)", 
-        "📈 衰竭跳空(上)", "📈 連續向上買入", "📈 SMA50上升趨勢", "📈 SMA50_200上升趨勢", 
-        "📈 新买入信号", "📈 RSI-MACD Oversold Crossover", "📈 EMA-SMA Uptrend Buy", 
-        "📈 Volume-MACD Buy", "📈 EMA10_30買入", "📈 EMA10_30_40強烈買入", "📈 看漲吞沒", 
-        "📈 錘頭線", "📈 早晨之星","✅ 量價","🔄 新转折点",
-        # 新增：VWAP、MFI、OBV 信号
-        "📈 VWAP買入", "📉 VWAP賣出", "📈 MFI牛背離買入", "📉 MFI熊背離賣出", "📈 OBV突破買入", "📉 OBV突破賣出",
-        # 新增：VIX 信号
-        "📉 VIX恐慌賣出", "📈 VIX平靜買入",
-        # 新增：VIX 趨勢信號
-        "📉 VIX上升趨勢賣出", "📈 VIX下降趨勢買入"
-    # ...其他K栏位信号. 注意不要遗漏你的所有信号
+EMA_CONFIGS = [
+    (5,   "#00ff88"), (10,  "#ccff00"), (20,  "#ffaa00"),
+    (30,  "#ff5500"), (40,  "#cc00ff"), (60,  "#0088ff"),
+    (120, "#00ccff"), (200, "#8866ff"),
 ]
+MA_CONFIGS = [(5, "#ffffff", "dash"), (15, "#ffdd66", "dot")]
 
-selected_signals = st.multiselect(
-    "选择哪些信号需要推送Telegram",
-    all_signal_types,
-    default=["📈 新买入信号"]
-)
+# ══════════════════════════════════════════════════════════════════════════════
+# Session State
+# ══════════════════════════════════════════════════════════════════════════════
+if "alert_log"   not in st.session_state: st.session_state.alert_log   = []
+if "sent_alerts" not in st.session_state: st.session_state.sent_alerts = set()
 
+# ══════════════════════════════════════════════════════════════════════════════
+# 市場環境數據
+# ══════════════════════════════════════════════════════════════════════════════
 
-# 新增：K线形态阈值调整（动态阈值优化）
-BODY_RATIO_THRESHOLD = st.number_input("K線實體占比閾值 (大陽/大陰線)", min_value=0.1, max_value=0.9, value=0.6, step=0.05)
-SHADOW_RATIO_THRESHOLD = st.number_input("K線影線長度閾值 (錘子/射擊線)", min_value=0.1, max_value=3.0, value=2.0, step=0.1)
-DOJI_BODY_THRESHOLD = st.number_input("十字星實體閾值占比", min_value=0.01, max_value=0.2, value=0.1, step=0.01)
+# 大盤指數代號
+MARKET_TICKERS = {
+    "SPY":  ("標普500 ETF", "spy"),
+    "QQQ":  ("那斯達克ETF", "qqq"),
+    "DIA":  ("道瓊ETF",     "dia"),
+    "^VIX": ("VIX恐慌指數", "vix"),
+    "^TNX": ("10年期美債", "tnx"),
+    "GLD":  ("黃金ETF",     "gld"),
+    "UUP":  ("美元指數ETF", "uup"),
+}
 
-# 新增：MFI背离窗口（最小改动，添加一个input）
-MFI_DIVERGENCE_WINDOW = st.number_input("MFI背离检测窗口 (根K線)", min_value=3, max_value=20, value=5, step=1)
-
-# 新增：VIX 阈值
-VIX_HIGH_THRESHOLD = st.number_input("VIX 恐慌閾值 (高)", min_value=20.0, max_value=50.0, value=30.0, step=1.0)
-VIX_LOW_THRESHOLD = st.number_input("VIX 平靜閾值 (低)", min_value=10.0, max_value=25.0, value=20.0, step=1.0)
-
-# 新增：VIX EMA 期數（趨勢信號）
-VIX_EMA_FAST = st.number_input("VIX 快速 EMA 期數", min_value=3, max_value=15, value=5, step=1)
-VIX_EMA_SLOW = st.number_input("VIX 慢速 EMA 期數", min_value=8, max_value=25, value=10, step=1)
-###add
-# 新增：成交密集區（Volume Profile 簡易版）參數
-st.subheader("成交密集區設定")
-VOLUME_PROFILE_BINS = st.number_input("價格分箱數量 (建議 30~100)", min_value=10, max_value=200, value=50, step=5)
-VOLUME_PROFILE_WINDOW = st.number_input("計算密集區的K線根數 (最近)", min_value=20, max_value=500, value=100, step=10)
-VOLUME_PROFILE_TOP_N = st.number_input("顯示前幾大密集區", min_value=1, max_value=5, value=3, step=1)
-VOLUME_PROFILE_SHOW_ON_CHART = st.checkbox("在K線圖上標記成交密集區", value=True)
-
-# 新增：Telegram 觸發條件表格（可編輯）
-st.subheader("📋 Telegram 觸發條件配置（可隨時編輯）")
-default_telegram_conditions = pd.DataFrame({
-    "排名": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
-    "異動標記": [
-        "📈 價格趨勢買入, 📈 持續跳空(上), 📈 SMA50上升趨勢, 📈 SMA50_200上升趨勢, 📈 EMA-SMA Uptrend Buy, 📈 OBV突破買入",
-        "📈 Low>High, 📈 價格趨勢買入, 📈 SMA50上升趨勢, 📈 EMA-SMA Uptrend Buy",
-        "📈 價格趨勢買入, 📈 SMA50上升趨勢, 📈 EMA-SMA Uptrend Buy, 📈 VIX平靜買入",
-        "📈 連續向上買入, 📈 SMA50上升趨勢, 📈 EMA-SMA Uptrend Buy",
-        "📈 突破跳空(上), 📈 SMA50上升趨勢, 📈 新买入信号, 📈 EMA-SMA Uptrend Buy",
-        "📈 普通跳空(上), 📈 連續向上買入, 📉 SMA50下降趨勢, 📈 新买入信号",
-        "📈 SMA50上升趨勢, 📈 EMA-SMA Uptrend Buy, 📈 OBV突破買入",
-        "📉 普通跳空(下), 📈 SMA50上升趨勢, 📈 EMA-SMA Uptrend Buy",
-        "📈 價格趨勢買入(量), 📈 價格趨勢買入(量%), 📈 SMA50上升趨勢, 📈 EMA-SMA Uptrend Buy",
-        "📈 EMA買入, 📈 連續向上買入, 📈 SMA50上升趨勢, 📈 EMA-SMA Uptrend Buy"
-    ],
-    "成交量標記": ["放量", "縮量", "放量", "縮量", "放量", "縮量", "放量", "縮量", "放量", "縮量"],
-    "K線形態": ["大陽線", "普通K線", "普通K線", "大陽線", "射擊之星", "普通K線", "十字星", "大陽線", "早晨之星", "看漲吞沒"]
-})
-default_telegram_conditions["排名"] = default_telegram_conditions["排名"].astype("string")
-telegram_conditions = st.data_editor(
-    default_telegram_conditions,
-    num_rows="dynamic",
-    column_config={
-        "排名": st.column_config.TextColumn("排名"),
-        "異動標記": st.column_config.TextColumn("異動標記", help="輸入多個信號，用逗號分隔"),
-        "成交量標記": st.column_config.SelectboxColumn("成交量標記", options=["放量", "縮量"]),
-        "K線形態": st.column_config.TextColumn("K線形態", help="輸入K線形態名稱")
-    },
-    use_container_width=True,
-    hide_index=False
-)
-
-placeholder = st.empty()
-
-@st.cache_data(ttl=300)  # 性能优化：缓存K线形态计算结果，TTL=5分钟
-def compute_kline_patterns(data, body_ratio_threshold, shadow_ratio_threshold, doji_body_threshold):
-    """缓存K线形态计算"""
-    data = data.copy()
-    data["成交量標記"] = data.apply(
-        lambda row: "放量" if row["Volume"] > row["前5均量"] else "縮量", axis=1
-    )
-    
-    def identify_candlestick_pattern(row, index, data):
-        pattern = "普通K線"
-        interpretation = "波動有限，方向不明顯"
-        if index > 0:
-            prev_close = data["Close"].iloc[index-1]
-            prev_open = data["Open"].iloc[index-1]
-            prev_high = data["High"].iloc[index-1]
-            prev_low = data["Low"].iloc[index-1]
-            curr_open = row["Open"]
-            curr_close = row["Close"]
-            curr_high = row["High"]
-            curr_low = row["Low"]
-            body_size = abs(curr_close - curr_open)
-            candle_range = curr_high - curr_low
-            prev_body_size = abs(prev_close - prev_open)
-            is_uptrend = data["Close"].iloc[max(0, index-5):index].mean() < curr_close if index >= 5 else False
-            is_downtrend = data["Close"].iloc[max(0, index-5):index].mean() > curr_close if index >= 5 else False
-            is_high_volume = row["Volume"] > row["前5均量"]
-
-            # 锤子线
-            if (body_size < candle_range * 0.3 and
-                (min(curr_open, curr_close) - curr_low) >= shadow_ratio_threshold * body_size and
-                (curr_high - max(curr_open, curr_close)) < (min(curr_open, curr_close) - curr_low) and
-                is_downtrend):
-                pattern = "錘子線"
-                interpretation = "下方出現支撐，空方雖打壓但多方承接" + ("，放量增強買入信號" if is_high_volume else "")
-
-            # 射击之星
-            elif (body_size < candle_range * 0.3 and
-                  (curr_high - max(curr_open, curr_close)) >= shadow_ratio_threshold * body_size and
-                  (min(curr_open, curr_close) - curr_low) < (curr_high - max(curr_open, curr_close)) and
-                  is_uptrend):
-                pattern = "射擊之星"
-                interpretation = "高位拋壓沉重，短期見頂風險" + ("，放量增強賣出信號" if is_high_volume else "")
-
-            # 十字星
-            elif body_size < doji_body_threshold * candle_range:
-                pattern = "十字星"
-                interpretation = "市場猶豫，方向未明確"
-
-            # 大阳线
-            elif (curr_close > curr_open and
-                  body_size > body_ratio_threshold * candle_range):
-                pattern = "大陽線"
-                interpretation = "多方強勢推升" + ("，放量更有力" if is_high_volume else "")
-
-            # 大阴线
-            elif (curr_close < curr_open and
-                  body_size > body_ratio_threshold * candle_range):
-                pattern = "大陰線"
-                interpretation = "空方強勢壓制" + ("，放量更偏空" if is_high_volume else "")
-
-            # 看涨吞噬
-            elif (curr_close > curr_open and
-                  prev_close < prev_open and
-                  curr_open < prev_close and
-                  curr_close > prev_open and
-                  is_high_volume):
-                pattern = "看漲吞噬"
-                interpretation = "當前陽線完全包覆前日陰線，買方強勢反攻，預示反轉"
-
-            # 看跌吞噬
-            elif (curr_close < curr_open and
-                  prev_close > prev_open and
-                  curr_open > prev_close and
-                  curr_close < prev_open and
-                  is_high_volume):
-                pattern = "看跌吞噬"
-                interpretation = "當前陰線完全包覆前日陽線，賣方強勢壓制，預示反轉"
-
-            # 乌云盖顶
-            elif (is_uptrend and
-                  curr_close < curr_open and
-                  prev_close > prev_open and
-                  curr_open > prev_close and
-                  curr_close < (prev_open + prev_close) / 2):
-                pattern = "烏雲蓋頂"
-                interpretation = "上升趨勢中陰線壓制，賣壓加重，短期可能下跌"
-
-            # 刺透形态
-            elif (is_downtrend and
-                  curr_close > curr_open and
-                  prev_close < prev_open and
-                  curr_open < prev_close and
-                  curr_close > (prev_open + prev_close) / 2):
-                pattern = "刺透形態"
-                interpretation = "下跌趨勢中陽線反攻，買方介入，短期可能上漲"
-
-            # 新增：早晨之星（扩展形态）
-            elif (index > 1 and
-                  data["Close"].iloc[index-2] < data["Open"].iloc[index-2] and  # 第一根阴线
-                  abs(data["Close"].iloc[index-1] - data["Open"].iloc[index-1]) < 0.3 * abs(data["Close"].iloc[index-2] - data["Open"].iloc[index-2]) and  # 第二根小实体
-                  curr_close > curr_open and  # 第三根阳线
-                  curr_close > (prev_open + prev_close) / 2 and  # 收盘高于前日中点
-                  is_high_volume):
-                pattern = "早晨之星"
-                interpretation = "下跌後小實體K線後強陽線，預示反轉，多方力量增強"
-
-            # 新增：黃昏之星（扩展形态）
-            elif (index > 1 and
-                  data["Close"].iloc[index-2] > data["Open"].iloc[index-2] and  # 第一根阳线
-                  abs(data["Close"].iloc[index-1] - data["Open"].iloc[index-1]) < 0.3 * abs(data["Close"].iloc[index-2] - data["Open"].iloc[index-2]) and  # 第二根小实体
-                  curr_close < curr_open and  # 第三根阴线
-                  curr_close < (prev_open + prev_close) / 2 and  # 收盘低于前日中点
-                  is_high_volume):
-                pattern = "黃昏之星"
-                interpretation = "上漲後小實體K線後強陰線，預示反轉，空方力量增強"
-
-        return pattern, interpretation
-
-    data[["K線形態", "單根解讀"]] = [
-        identify_candlestick_pattern(row, i, data) for i, row in data.iterrows()
-    ]
-    return data
-
-while True:
-    with placeholder.container():
-        st.subheader(f"⏱ 更新時間：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-
-        for ticker in selected_tickers:
-            try:
-                stock = yf.Ticker(ticker)
-                data = stock.history(period=selected_period, interval=selected_interval).reset_index()
-
-                if data.empty or len(data) < 2:
-                    st.warning(f"⚠️ {ticker} 無數據或數據不足（期間：{selected_period}，間隔：{selected_interval}），請嘗試其他時間範圍或間隔")
-                    continue
-
-                if "Date" in data.columns:
-                    data = data.rename(columns={"Date": "Datetime"})
-                elif "Datetime" not in data.columns:
-                    st.warning(f"⚠️ {ticker} 數據缺少時間列，無法處理")
-                    continue
-
-                data["Price Change %"] = data["Close"].pct_change().round(4) * 100
-                data["Volume Change %"] = data["Volume"].pct_change().round(4) * 100
-                data["Close_Difference"] = data['Close'].diff().round(2)
-                data["High_Difference"] = data['High'].diff().round(2)
-                data["Low_Difference"] = data['Low'].diff().round(2)
-                data["Close_N_High"] = (data['Close']-data['Low'])/(data['High']-data['Low'])
-                data["HIGH_High_%"] = ((data["High"].shift(-1)-data["High"])/data["High"])*100
-                data["Close_N_Low"] = (data['High']-data['Close'])/(data['High']-data['Low'])
-                
-                data["前5均價"] = data["Price Change %"].rolling(window=5).mean()
-                data["前5均價ABS"] = abs(data["Price Change %"]).rolling(window=5).mean()
-                data["前5均量"] = data["Volume"].rolling(window=5).mean()
-                data["📈 股價漲跌幅 (%)"] = ((abs(data["Price Change %"]) - data["前5均價ABS"]) / data["前5均價ABS"]).round(4) * 100
-                data["📊 成交量變動幅 (%)"] = ((data["Volume"] - data["前5均量"]) / data["前5均量"]).round(4) * 100
-
-                data["MACD"], data["Signal"], data["Histogram"] = calculate_macd(data)
-                data["EMA5"] = data["Close"].ewm(span=5, adjust=False).mean()
-                data["EMA10"] = data["Close"].ewm(span=10, adjust=False).mean()
-                data["EMA30"] = data["Close"].ewm(span=30, adjust=False).mean()
-                data["EMA40"] = data["Close"].ewm(span=40, adjust=False).mean()
-                data["RSI"] = calculate_rsi(data)
-                
-                # 新增：计算 VWAP、MFI、OBV
-                data["VWAP"] = calculate_vwap(data)
-                data["MFI"] = calculate_mfi(data)
-                data["OBV"] = calculate_obv(data)
-                
-                # 新增：获取 VIX 数据并合并
-                vix_data = get_vix_data(selected_period, selected_interval)
-                if not vix_data.empty:
-                    data = data.merge(vix_data[["Datetime", "Close", "VIX Change %"]], on="Datetime", how="left", suffixes=("", "_VIX"))
-                    data.rename(columns={"Close_VIX": "VIX"}, inplace=True)
-                else:
-                    data["VIX"] = np.nan
-                    data["VIX Change %"] = np.nan
-                
-                # 新增：計算 VIX 趨勢 EMA
-                if not data["VIX"].isna().all():
-                    data["VIX_EMA_Fast"], data["VIX_EMA_Slow"] = calculate_vix_trend(data, VIX_EMA_FAST, VIX_EMA_SLOW)
-                else:
-                    data["VIX_EMA_Fast"] = np.nan
-                    data["VIX_EMA_Slow"] = np.nan
-                
-                data['Up'] = (data['Close'] > data['Close'].shift(1)).astype(int)
-                data['Down'] = (data['Close'] < data['Close'].shift(1)).astype(int)
-                data['Continuous_Up'] = data['Up'] * (data['Up'].groupby((data['Up'] == 0).cumsum()).cumcount() + 1)
-                data['Continuous_Down'] = data['Down'] * (data['Down'].groupby((data['Down'] == 0).cumsum()).cumcount() + 1)
-                
-                data["SMA50"] = data["Close"].rolling(window=50).mean()
-                data["SMA200"] = data["Close"].rolling(window=200).mean()
-                
-                # 新增：MFI背离检测（预计算列）
-                window = MFI_DIVERGENCE_WINDOW
-                data['Close_Roll_Max'] = data['Close'].rolling(window=window).max()
-                data['MFI_Roll_Max'] = data['MFI'].rolling(window=window).max()
-                data['Close_Roll_Min'] = data['Close'].rolling(window=window).min()
-                data['MFI_Roll_Min'] = data['MFI'].rolling(window=window).min()
-                data['MFI_Bear_Div'] = (data['Close'] == data['Close_Roll_Max']) & (data['MFI'] < data['MFI_Roll_Max'].shift(1))
-                data['MFI_Bull_Div'] = (data['Close'] == data['Close_Roll_Min']) & (data['MFI'] > data['MFI_Roll_Min'].shift(1))
-                data["High_Max"] = data["High"].rolling(window=window).max()
-                data["Low_Min"] = data["Low"].rolling(window=window).min()
-                # 新增：OBV突破（预计算，20期滚动新高/新低）
-                data['OBV_Roll_Max'] = data['OBV'].rolling(window=20).max()
-                data['OBV_Roll_Min'] = data['OBV'].rolling(window=20).min()
-                
-                def mark_signal(row, index):
-                    signals = []
-                    if abs(row["📈 股價漲跌幅 (%)"]) >= PRICE_THRESHOLD and abs(row["📊 成交量變動幅 (%)"]) >= VOLUME_THRESHOLD:
-                        signals.append("✅ 量價")
-                    if index > 0 and row["Low"] > data["High"].iloc[index-1]:
-                        signals.append("📈 Low>High")
-                    if index > 0 and row["High"] < data["Low"].iloc[index-1]:
-                        signals.append("📉 High<Low")
-
-                    if index > 0 and row["Close_N_High"] >=HIGH_N_HIGH_THRESHOLD:
-                        signals.append("📈 HIGH_N_HIGH")
-                        
-                    if index > 0 and row["Close_N_Low"] >= LOW_N_LOW_THRESHOLD:
-                        signals.append("📉 LOW_N_LOW")
-                        
-                    if index > 0 and row["MACD"] > 0 and data["MACD"].iloc[index-1] <= 0 and row["RSI"] < 50:
-                        signals.append("📈 MACD買入")
-                    if index > 0 and row["MACD"] <= 0 and data["MACD"].iloc[index-1] > 0 and row["RSI"] > 50:
-                        signals.append("📉 MACD賣出")
-                    if (index > 0 and row["EMA5"] > row["EMA10"] and 
-                        data["EMA5"].iloc[index-1] <= data["EMA10"].iloc[index-1] and 
-                        row["Volume"] > data["Volume"].iloc[index-1] and row["RSI"] < 50):
-                        signals.append("📈 EMA買入")
-                    if (index > 0 and row["EMA5"] < row["EMA10"] and 
-                        data["EMA5"].iloc[index-1] >= data["EMA10"].iloc[index-1] and 
-                        row["Volume"] > data["Volume"].iloc[index-1] and row["RSI"] > 50):
-                        signals.append("📉 EMA賣出")
-                    if (index > 0 and row["High"] > data["High"].iloc[index-1] and 
-                        row["Low"] > data["Low"].iloc[index-1] and 
-                        row["Close"] > data["Close"].iloc[index-1] and row["MACD"] > 0):
-                        signals.append("📈 價格趨勢買入")
-                    if (index > 0 and row["High"] < data["High"].iloc[index-1] and 
-                        row["Low"] < data["Low"].iloc[index-1] and 
-                        row["Close"] < data["Close"].iloc[index-1] and row["MACD"] < 0):
-                        signals.append("📉 價格趨勢賣出")
-                    if (index > 0 and row["High"] > data["High"].iloc[index-1] and 
-                        row["Low"] > data["Low"].iloc[index-1] and 
-                        row["Close"] > data["Close"].iloc[index-1] and 
-                        row["Volume"] > data["前5均量"].iloc[index] and row["RSI"] < 50):
-                        signals.append("📈 價格趨勢買入(量)")
-                    if (index > 0 and row["High"] < data["High"].iloc[index-1] and 
-                        row["Low"] < data["Low"].iloc[index-1] and 
-                        row["Close"] < data["Close"].iloc[index-1] and 
-                        row["Volume"] > data["前5均量"].iloc[index] and row["RSI"] > 50):
-                        signals.append("📉 價格趨勢賣出(量)")
-                    if (index > 0 and row["High"] > data["High"].iloc[index-1] and 
-                        row["Low"] > data["Low"].iloc[index-1] and 
-                        row["Close"] > data["Close"].iloc[index-1] and 
-                        row["Volume Change %"] > 15 and row["RSI"] < 50):
-                        signals.append("📈 價格趨勢買入(量%)")
-                    if (index > 0 and row["High"] < data["High"].iloc[index-1] and 
-                        row["Low"] < data["Low"].iloc[index-1] and 
-                        row["Close"] < data["Close"].iloc[index-1] and 
-                        row["Volume Change %"] > 15 and row["RSI"] > 50):
-                        signals.append("📉 價格趨勢賣出(量%)")
-                    if index > 0:
-                        gap_pct = ((row["Open"] - data["Close"].iloc[index-1]) / data["Close"].iloc[index-1]) * 100
-                        is_up_gap = gap_pct > GAP_THRESHOLD
-                        is_down_gap = gap_pct < -GAP_THRESHOLD
-                        if is_up_gap or is_down_gap:
-                            trend = data["Close"].iloc[index-5:index].mean() if index >= 5 else 0
-                            prev_trend = data["Close"].iloc[index-6:index-1].mean() if index >= 6 else trend
-                            is_up_trend = row["Close"] > trend and trend > prev_trend
-                            is_down_trend = row["Close"] < trend and trend < prev_trend
-                            is_high_volume = row["Volume"] > data["前5均量"].iloc[index]
-                            is_price_reversal = (index < len(data) - 1 and
-                                                ((is_up_gap and data["Close"].iloc[index+1] < row["Close"]) or
-                                                 (is_down_gap and data["Close"].iloc[index+1] > row["Close"])))
-                            if is_up_gap:
-                                if is_price_reversal and is_high_volume:
-                                    signals.append("📈 衰竭跳空(上)")
-                                elif is_up_trend and is_high_volume:
-                                    signals.append("📈 持續跳空(上)")
-                                elif row["High"] > data["High"].iloc[index-1:index].max() and is_high_volume:
-                                    signals.append("📈 突破跳空(上)")
-                                else:
-                                    signals.append("📈 普通跳空(上)")
-                            elif is_down_gap:
-                                if is_price_reversal and is_high_volume:
-                                    signals.append("📉 衰竭跳空(下)")
-                                elif is_down_trend and is_high_volume:
-                                    signals.append("📉 持續跳空(下)")
-                                elif row["Low"] < data["Low"].iloc[index-1:index].min() and is_high_volume:
-                                    signals.append("📉 突破跳空(下)")
-                                else:
-                                    signals.append("📉 普通跳空(下)")
-                    if row['Continuous_Up'] >= CONTINUOUS_UP_THRESHOLD and row["RSI"] < 70:
-                        signals.append("📈 連續向上買入")
-                    if row['Continuous_Down'] >= CONTINUOUS_DOWN_THRESHOLD and row["RSI"] > 30:
-                        signals.append("📉 連續向下賣出")
-                    if pd.notna(row["SMA50"]):
-                        if row["Close"] > row["SMA50"] and row["MACD"] > 0:
-                            signals.append("📈 SMA50上升趨勢")
-                        elif row["Close"] < row["SMA50"] and row["MACD"] < 0:
-                            signals.append("📉 SMA50下降趨勢")
-                    if pd.notna(row["SMA50"]) and pd.notna(row["SMA200"]):
-                        if row["Close"] > row["SMA50"] and row["SMA50"] > row["SMA200"] and row["MACD"] > 0:
-                            signals.append("📈 SMA50_200上升趨勢")
-                        elif row["Close"] < row["SMA50"] and row["SMA50"] < row["SMA200"] and row["MACD"] < 0:
-                            signals.append("📉 SMA50_200下降趨勢")
-                    if index > 0 and row["Close"] > row["Open"] and row["Open"] > data["Close"].iloc[index-1] and row["RSI"] < 70:
-                        signals.append("📈 新买入信号")
-                    if index > 0 and row["Close"] < row["Open"] and row["Open"] < data["Close"].iloc[index-1] and row["RSI"] > 30:
-                        signals.append("📉 新卖出信号")
-                    if index > 0 and abs(row["Price Change %"]) > PRICE_CHANGE_THRESHOLD and abs(row["Volume Change %"]) > VOLUME_CHANGE_THRESHOLD and row["MACD"] > row["Signal"]:
-                        signals.append("🔄 新转折点")
-                    if len(signals) > 8:
-                        signals.append(f"🔥 关键转折点 (信号数: {len(signals)})")
-                    if index > 0 and row["RSI"] < 30 and row["MACD"] > 0 and data["MACD"].iloc[index-1] <= 0:
-                        signals.append("📈 RSI-MACD Oversold Crossover")
-                    if index > 0 and row["EMA5"] > row["EMA10"] and row["Close"] > row["SMA50"]:
-                        signals.append("📈 EMA-SMA Uptrend Buy")
-                    if index > 0 and row["Volume"] > data["前5均量"].iloc[index] and row["MACD"] > 0 and data["MACD"].iloc[index-1] <= 0:
-                        signals.append("📈 Volume-MACD Buy")
-                    if index > 0 and row["RSI"] > 70 and row["MACD"] < 0 and data["MACD"].iloc[index-1] >= 0:
-                        signals.append("📉 RSI-MACD Overbought Crossover")
-                    if index > 0 and row["EMA5"] < row["EMA10"] and row["Close"] < row["SMA50"]:
-                        signals.append("📉 EMA-SMA Downtrend Sell")
-                    if index > 0 and row["Volume"] > data["前5均量"].iloc[index] and row["MACD"] < 0 and data["MACD"].iloc[index-1] >= 0:
-                        signals.append("📉 Volume-MACD Sell")
-                    if (index > 0 and row["EMA10"] > row["EMA30"] and 
-                        data["EMA10"].iloc[index-1] <= data["EMA30"].iloc[index-1]):
-                        signals.append("📈 EMA10_30買入")
-                    if (index > 0 and row["EMA10"] > row["EMA30"] and 
-                        data["EMA10"].iloc[index-1] <= data["EMA30"].iloc[index-1] and 
-                        row["EMA10"] > row["EMA40"]):
-                        signals.append("📈 EMA10_30_40強烈買入")
-                    if (index > 0 and row["EMA10"] < row["EMA30"] and 
-                        data["EMA10"].iloc[index-1] >= data["EMA30"].iloc[index-1]):
-                        signals.append("📉 EMA10_30賣出")
-                    if (index > 0 and row["EMA10"] < row["EMA30"] and 
-                        data["EMA10"].iloc[index-1] >= data["EMA30"].iloc[index-1] and 
-                        row["EMA10"] < row["EMA40"]):
-                        signals.append("📉 EMA10_30_40強烈賣出")
-                    if (index > 0 and 
-                        data["Close"].iloc[index-1] < data["Open"].iloc[index-1] and 
-                        row["Close"] > row["Open"] and 
-                        row["Open"] < data["Close"].iloc[index-1] and 
-                        row["Close"] > data["Open"].iloc[index-1] and 
-                        row["Volume"] > data["前5均量"].iloc[index] and 
-                        row["RSI"] < 50):
-                        signals.append("📈 看漲吞沒")
-                    if (index > 0 and 
-                        data["Close"].iloc[index-1] > data["Open"].iloc[index-1] and 
-                        row["Close"] < row["Open"] and 
-                        row["Open"] > data["Close"].iloc[index-1] and 
-                        row["Close"] < data["Open"].iloc[index-1] and 
-                        row["Volume"] > data["前5均量"].iloc[index] and 
-                        row["RSI"] > 50):
-                        signals.append("📉 看跌吞沒")
-                    if (index > 0 and 
-                        row["Close"] > data["Close"].iloc[index-1] and
-                        abs(row["Close"] - row["Open"]) < (row["High"] - row["Low"]) * 0.3 and 
-                        (min(row["Open"], row["Close"]) - row["Low"]) >= 2 * abs(row["Close"] - row["Open"]) and 
-                        (row["High"] - max(row["Open"], row["Close"])) < (min(row["Open"], row["Close"]) - row["Low"]) and 
-                        row["Volume"] > data["前5均量"].iloc[index] and 
-                        row["RSI"] < 50):
-                        signals.append("📈 錘頭線")
-                    if (index > 0 and 
-                        row["Close"] < data["Close"].iloc[index-1] and
-                        abs(row["Close"] - row["Open"]) < (row["High"] - row["Low"]) * 0.3 and 
-                        (min(row["Open"], row["Close"]) - row["Low"]) >= 2 * abs(row["Close"] - row["Open"]) and 
-                        (row["High"] - max(row["Open"], row["Close"])) < (min(row["Open"], row["Close"]) - row["Low"]) and 
-                        row["Volume"] > data["前5均量"].iloc[index] and 
-                        row["RSI"] > 50):
-                        signals.append("📉 上吊線")
-                    if (index > 1 and 
-                        data["Close"].iloc[index-2] < data["Open"].iloc[index-2] and
-                        abs(data["Close"].iloc[index-1] - data["Open"].iloc[index-1]) < 0.3 * abs(data["Close"].iloc[index-2] - data["Open"].iloc[index-2]) and
-                        row["Close"] > row["Open"] and
-                        row["Close"] > (data["Open"].iloc[index-2] + data["Close"].iloc[index-2]) / 2 and
-                        row["Volume"] > data["前5均量"].iloc[index] and 
-                        row["RSI"] < 50):
-                        signals.append("📈 早晨之星")
-                    if (index > 1 and 
-                        data["Close"].iloc[index-2] > data["Open"].iloc[index-2] and
-                        abs(data["Close"].iloc[index-1] - data["Open"].iloc[index-1]) < 0.3 * abs(data["Close"].iloc[index-2] - data["Open"].iloc[index-2]) and
-                        row["Close"] < row["Open"] and
-                        row["Close"] < (data["Open"].iloc[index-2] + data["Close"].iloc[index-2]) / 2 and
-                        row["Volume"] > data["前5均量"].iloc[index] and 
-                        row["RSI"] > 50):
-                        signals.append("📉 黃昏之星")
-
-                    if index > 0 and row["High"] > data['High_Max'].iloc[index-1]:
-                        signals.append("📈 BreakOut_5K")
-                        
-                    if index > 0 and row["Low"] < data['Low_Min'].iloc[index-1]:
-                        signals.append("📉 BreakDown_5K")
-                        
-                        
-                    # 新增：烏雲蓋頂
-                    if (index > 0 and 
-                        data["Close"].iloc[index-1] > data["Open"].iloc[index-1] and  # 前一日陽線
-                        row["Open"] > data["Close"].iloc[index-1] and  # 當前開盤高於前日收盤
-                        row["Close"] < row["Open"] and  # 當前為陰線
-                        row["Close"] < (data["Open"].iloc[index-1] + data["Close"].iloc[index-1]) / 2 and  # 收盤低於前日K線中點
-                        row["Volume"] > data["前5均量"].iloc[index]):  # 成交量放大
-                        signals.append("📉 烏雲蓋頂")
-                    # 新增：刺透形態
-                    if (index > 0 and 
-                        data["Close"].iloc[index-1] < data["Open"].iloc[index-1] and  # 前一日陰線
-                        row["Open"] < data["Close"].iloc[index-1] and  # 當前開盤低於前日收盤
-                        row["Close"] > row["Open"] and  # 當前為陽線
-                        row["Close"] > (data["Open"].iloc[index-1] + data["Close"].iloc[index-1]) / 2 and  # 收盤高於前日K線中點
-                        row["Volume"] > data["前5均量"].iloc[index]):  # 成交量放大
-                        signals.append("📈 刺透形態")
-                    # 新增：VWAP信号（作为主进出场基准）
-                    if index > 0 and pd.notna(row["VWAP"]):
-                        if row["Close"] > row["VWAP"] and data["Close"].iloc[index-1] <= data["VWAP"].iloc[index-1]:
-                            signals.append("📈 VWAP買入")
-                        elif row["Close"] < row["VWAP"] and data["Close"].iloc[index-1] >= data["VWAP"].iloc[index-1]:
-                            signals.append("📉 VWAP賣出")
-                    # 新增：MFI背离信号
-                    if index >= MFI_DIVERGENCE_WINDOW and pd.notna(row["MFI"]):
-                        if data['MFI_Bull_Div'].iloc[index]:
-                            signals.append("📈 MFI牛背離買入")
-                        if data['MFI_Bear_Div'].iloc[index]:
-                            signals.append("📉 MFI熊背離賣出")
-                    # 新增：OBV突破信号（确认突破量能）
-                    if index > 0 and pd.notna(row["OBV"]):
-                        if row["Close"] > data["Close"].iloc[index-1] and row["OBV"] > data['OBV_Roll_Max'].iloc[index-1]:
-                            signals.append("📈 OBV突破買入")
-                        elif row["Close"] < data["Close"].iloc[index-1] and row["OBV"] < data['OBV_Roll_Min'].iloc[index-1]:
-                            signals.append("📉 OBV突破賣出")
-                    # 新增：VIX 恐慌指数信号
-                    if index > 0 and pd.notna(row["VIX"]):
-                        vix_prev = data["VIX"].iloc[index-1]
-                        if row["VIX"] > VIX_HIGH_THRESHOLD and row["VIX"] > vix_prev:
-                            signals.append("📉 VIX恐慌賣出")
-                        elif row["VIX"] < VIX_LOW_THRESHOLD and row["VIX"] < vix_prev:
-                            signals.append("📈 VIX平靜買入")
-                    # 新增：VIX 趨勢信號（EMA交叉）
-                    if index > 0 and pd.notna(row["VIX_EMA_Fast"]) and pd.notna(row["VIX_EMA_Slow"]):
-                        if row["VIX_EMA_Fast"] > row["VIX_EMA_Slow"] and data["VIX_EMA_Fast"].iloc[index-1] <= data["VIX_EMA_Slow"].iloc[index-1]:
-                            signals.append("📉 VIX上升趨勢賣出")
-                        elif row["VIX_EMA_Fast"] < row["VIX_EMA_Slow"] and data["VIX_EMA_Fast"].iloc[index-1] >= data["VIX_EMA_Slow"].iloc[index-1]:
-                            signals.append("📈 VIX下降趨勢買入")
-                    return ", ".join(signals) if signals else ""
-                
-                data["異動標記"] = [mark_signal(row, i) for i, row in data.iterrows()]
-
-                # 性能优化：使用缓存函数计算K线形态
-                data = compute_kline_patterns(data, BODY_RATIO_THRESHOLD, SHADOW_RATIO_THRESHOLD, DOJI_BODY_THRESHOLD)
-                #add
-                # 新增：計算成交密集區
-                dense_areas = calculate_volume_profile_dense_areas(
-                    data, 
-                    bins=VOLUME_PROFILE_BINS, 
-                    window=VOLUME_PROFILE_WINDOW, 
-                    top_n=VOLUME_PROFILE_TOP_N
-                )
-                
-                # 判斷最新一根K線是否接近密集區（例如距離中心 < 1% 或在區間內）
-                latest_close = data['Close'].iloc[-1]
-                near_dense = False
-                near_dense_info = ""
-                if dense_areas:
-                    for area in dense_areas:
-                        center = area['price_center']
-                        low = area['price_low']
-                        high = area['price_high']
-                        if low <= latest_close <= high:
-                            near_dense = True
-                            near_dense_info = f"目前位於成交密集區內 ({low:.2f} ~ {high:.2f})"
-                            break
-                        dist_pct = abs(latest_close - center) / center * 100
-                        if dist_pct <= 1.0:  # 可調
-                            near_dense = True
-                            near_dense_info = f"接近成交密集區中心 {center:.2f} ({dist_pct:.2f}% 距離)"
-                            break
-
-                # 新增：综合解读（最后 5 根 K 线）（最小改动，添加VWAP/MFI/OBV/VIX提及）
-                def generate_comprehensive_interpretation(data):
-                    last_5 = data.tail(5)
-                    if len(last_5) < 5:
-                        return "數據不足，無法生成綜合解讀"
-                    
-                    patterns = last_5["K線形態"].value_counts()
-                    volume_status = last_5["成交量標記"].value_counts()
-                    bullish_count = len(last_5[last_5["K線形態"].isin(["錘子線", "大陽線", "看漲吞噬", "刺透形態", "早晨之星"])])
-                    bearish_count = len(last_5[last_5["K線形態"].isin(["射擊之星", "大陰線", "看跌吞噬", "烏雲蓋頂", "黃昏之星"])])
-                    neutral_count = len(last_5[last_5["K線形態"].isin(["十字星", "普通K線"])])
-                    high_volume_count = len(last_5[last_5["成交量標記"] == "放量"])
-
-                    vwap_trend = "多頭（價格>VWAP）" if last_5["Close"].iloc[-1] > last_5["VWAP"].iloc[-1] else "空頭（價格<VWAP）"
-                    mfi_level = f"MFI={last_5['MFI'].iloc[-1]:.1f}（{'超賣背離機會' if last_5['MFI'].iloc[-1] < 20 else '超買背離風險' if last_5['MFI'].iloc[-1] > 80 else '中性'}）"
-                    obv_trend = "OBV上漲確認量能" if last_5["OBV"].iloc[-1] > last_5["OBV"].iloc[0] else "OBV下跌警示量能不足"
-                    vix_level = f"VIX={last_5['VIX'].iloc[-1]:.1f}（{'恐慌高位' if last_5['VIX'].iloc[-1] > VIX_HIGH_THRESHOLD else '平靜低位' if last_5['VIX'].iloc[-1] < VIX_LOW_THRESHOLD else '中性'}）"
-                    vix_trend = "VIX趨勢上升（EMA Fast > Slow）" if last_5["VIX_EMA_Fast"].iloc[-1] > last_5["VIX_EMA_Slow"].iloc[-1] else "VIX趨勢下降（EMA Fast < Slow）"
-
-                    if bullish_count >= 3 and high_volume_count >= 3:
-                        return f"最近五日多方主導，出現多根看漲形態（如大陽線或看漲吞噬）且多伴隨放量，市場呈現強勢上漲趨勢，{vwap_trend}，{mfi_level}，{obv_trend}，{vix_level}，{vix_trend}，建議關注買入機會。"
-                    elif bearish_count >= 3 and high_volume_count >= 3:
-                        return f"最近五日空方主導，出現多根看跌形態（如大陰線或看跌吞噬）且多伴隨放量，市場呈現強勢下跌趨勢，{vwap_trend}，{mfi_level}，{obv_trend}，{vix_level}，{vix_trend}，建議注意賣出風險。"
-                    elif neutral_count >= 3:
-                        return f"最近五日多空交戰，型態以十字星或普通K線為主，成交量無明顯趨勢，市場處於盤整或方向不明階段，{vwap_trend}，{mfi_level}，{obv_trend}，{vix_level}，{vix_trend}。"
-                    elif bullish_count >= 2 and bearish_count >= 2:
-                        return f"最近五日多空激烈爭奪，看漲與看跌形態交替出現，成交量變化不一，市場方向不明，建議觀望，{vwap_trend}，{mfi_level}，{obv_trend}，{vix_level}，{vix_trend}。"
-                    else:
-                        return f"最近五日市場型態與成交量無明顯趨勢，建議持續觀察後續動向，{vwap_trend}，{mfi_level}，{obv_trend}，{vix_level}，{vix_trend}。"
-                    #add
-                    dense_desc = ""
-                    if dense_areas:
-                        centers = [a['price_center'] for a in dense_areas]
-                        dense_desc = f"，目前成交密集區集中在 {', '.join([f'{c:.2f}' for c in centers])} 等價位（潛在強支撐/壓力）"
-                    # 在 return 裡面加上 dense_desc
-                    return f"...{dense_desc}。建議持續觀察..."
-
-                comprehensive_interpretation = generate_comprehensive_interpretation(data)
-
-                # 当前资料
-                current_price = data["Close"].iloc[-1]
-                previous_close = stock.info.get("previousClose", current_price)
-                price_change = current_price - previous_close
-                price_pct_change = (price_change / previous_close) * 100 if previous_close else 0
-
-                last_volume = data["Volume"].iloc[-1]
-                prev_volume = data["Volume"].iloc[-2] if len(data) > 1 else last_volume
-                volume_change = last_volume - prev_volume
-                volume_pct_change = (volume_change / prev_volume) * 100 if prev_volume else 0
-
-                # 检查 Low > High、High < Low、MACD、EMA、价格趋势及带成交量条件的价格趋势信号
-                low_high_signal = len(data) > 1 and data["Low"].iloc[-1] > data["High"].iloc[-2]
-                high_low_signal = len(data) > 1 and data["High"].iloc[-1] < data["Low"].iloc[-2]
-                macd_buy_signal = len(data) > 1 and data["MACD"].iloc[-1] > 0 and data["MACD"].iloc[-2] <= 0
-                macd_sell_signal = len(data) > 1 and data["MACD"].iloc[-1] <= 0 and data["MACD"].iloc[-2] > 0
-                ema_buy_signal = (len(data) > 1 and 
-                                 data["EMA5"].iloc[-1] > data["EMA10"].iloc[-1] and 
-                                 data["EMA5"].iloc[-2] <= data["EMA10"].iloc[-2] and 
-                                 data["Volume"].iloc[-1] > data["Volume"].iloc[-2])
-                ema_sell_signal = (len(data) > 1 and 
-                                  data["EMA5"].iloc[-1] < data["EMA10"].iloc[-1] and 
-                                  data["EMA5"].iloc[-2] >= data["EMA10"].iloc[-2] and 
-                                  data["Volume"].iloc[-1] > data["Volume"].iloc[-2])
-                price_trend_buy_signal = (len(data) > 1 and 
-                                         data["High"].iloc[-1] > data["High"].iloc[-2] and 
-                                         data["Low"].iloc[-1] > data["Low"].iloc[-2] and 
-                                         data["Close"].iloc[-1] > data["Close"].iloc[-2])
-                price_trend_sell_signal = (len(data) > 1 and 
-                                          data["High"].iloc[-1] < data["High"].iloc[-2] and 
-                                          data["Low"].iloc[-1] < data["Low"].iloc[-2] and 
-                                          data["Close"].iloc[-1] < data["Close"].iloc[-2])
-                price_trend_vol_buy_signal = (len(data) > 1 and 
-                                             data["High"].iloc[-1] > data["High"].iloc[-2] and 
-                                             data["Low"].iloc[-1] > data["Low"].iloc[-2] and 
-                                             data["Close"].iloc[-1] > data["Close"].iloc[-2] and 
-                                             data["Volume"].iloc[-1] > data["前5均量"].iloc[-1])
-                price_trend_vol_sell_signal = (len(data) > 1 and 
-                                              data["High"].iloc[-1] < data["High"].iloc[-2] and 
-                                              data["Low"].iloc[-1] < data["Low"].iloc[-2] and 
-                                              data["Close"].iloc[-1] < data["Close"].iloc[-2] and 
-                                              data["Volume"].iloc[-1] > data["前5均量"].iloc[-1])
-                price_trend_vol_pct_buy_signal = (len(data) > 1 and 
-                                                 data["High"].iloc[-1] > data["High"].iloc[-2] and 
-                                                 data["Low"].iloc[-1] > data["Low"].iloc[-2] and 
-                                                 data["Close"].iloc[-1] > data["Close"].iloc[-2] and 
-                                                 data["Volume Change %"].iloc[-1] > 15)
-                price_trend_vol_pct_sell_signal = (len(data) > 1 and 
-                                                  data["High"].iloc[-1] < data["High"].iloc[-2] and 
-                                                  data["Low"].iloc[-1] < data["Low"].iloc[-2] and 
-                                                  data["Close"].iloc[-1] < data["Close"].iloc[-2] and 
-                                                  data["Volume Change %"].iloc[-1] > 15)
-                new_buy_signal = (len(data) > 1 and 
-                                 data["Close"].iloc[-1] > data["Open"].iloc[-1] and 
-                                 data["Open"].iloc[-1] > data["Close"].iloc[-2])
-                new_sell_signal = (len(data) > 1 and 
-                                  data["Close"].iloc[-1] < data["Open"].iloc[-1] and 
-                                  data["Open"].iloc[-1] < data["Close"].iloc[-2])
-                new_pivot_signal = (len(data) > 1 and 
-                                   abs(data["Price Change %"].iloc[-1]) > PRICE_CHANGE_THRESHOLD and 
-                                   abs(data["Volume Change %"].iloc[-1] ) > VOLUME_CHANGE_THRESHOLD)
-                ema10_30_buy_signal = (len(data) > 1 and 
-                                       data["EMA10"].iloc[-1] > data["EMA30"].iloc[-1] and 
-                                       data["EMA10"].iloc[-2] <= data["EMA30"].iloc[-2])
-                ema10_30_40_strong_buy_signal = (len(data) > 1 and 
-                                                 data["EMA10"].iloc[-1] > data["EMA30"].iloc[-1] and 
-                                                 data["EMA10"].iloc[-2] <= data["EMA30"].iloc[-2] and 
-                                                 data["EMA10"].iloc[-1] > data["EMA40"].iloc[-1])
-                ema10_30_sell_signal = (len(data) > 1 and 
-                                        data["EMA10"].iloc[-1] < data["EMA30"].iloc[-1] and 
-                                        data["EMA10"].iloc[-2] >= data["EMA30"].iloc[-2])
-                ema10_30_40_strong_sell_signal = (len(data) > 1 and 
-                                                  data["EMA10"].iloc[-1] < data["EMA30"].iloc[-1] and 
-                                                  data["EMA10"].iloc[-2] >= data["EMA30"].iloc[-2] and 
-                                                  data["EMA10"].iloc[-1] < data["EMA40"].iloc[-1])
-                bullish_engulfing = (len(data) > 1 and 
-                                     data["Close"].iloc[-2] < data["Open"].iloc[-2] and 
-                                     data["Close"].iloc[-1] > data["Open"].iloc[-1] and 
-                                     data["Open"].iloc[-1] < data["Close"].iloc[-2] and 
-                                     data["Close"].iloc[-1] > data["Open"].iloc[-2] and 
-                                     data["Volume"].iloc[-1] > data["前5均量"].iloc[-1] and 
-                                     data["RSI"].iloc[-1] < 50)
-                bearish_engulfing = (len(data) > 1 and 
-                                     data["Close"].iloc[-2] > data["Open"].iloc[-2] and 
-                                     data["Close"].iloc[-1] < data["Open"].iloc[-1] and 
-                                     data["Open"].iloc[-1] > data["Close"].iloc[-2] and 
-                                     data["Close"].iloc[-1] < data["Open"].iloc[-2] and 
-                                     data["Volume"].iloc[-1] > data["前5均量"].iloc[-1] and 
-                                     data["RSI"].iloc[-1] > 50)
-                hammer = (len(data) > 1 and 
-                          data["Close"].iloc[-1] > data["Close"].iloc[-2] and 
-                          abs(data["Close"].iloc[-1] - data["Open"].iloc[-1]) < (data["High"].iloc[-1] - data["Low"].iloc[-1]) * 0.3 and 
-                          (min(data["Open"].iloc[-1], data["Close"].iloc[-1]) - data["Low"].iloc[-1]) >= 2 * abs(data["Close"].iloc[-1] - data["Open"].iloc[-1]) and 
-                          (data["High"].iloc[-1] - max(data["Open"].iloc[-1], data["Close"].iloc[-1])) < (min(data["Open"].iloc[-1], data["Close"].iloc[-1]) - data["Low"].iloc[-1]) and 
-                          data["Volume"].iloc[-1] > data["前5均量"].iloc[-1] and 
-                          data["RSI"].iloc[-1] < 50)
-                hanging_man = (len(data) > 1 and 
-                               data["Close"].iloc[-1] < data["Close"].iloc[-2] and 
-                               abs(data["Close"].iloc[-1] - data["Open"].iloc[-1]) < (data["High"].iloc[-1] - data["Low"].iloc[-1]) * 0.3 and 
-                               (min(data["Open"].iloc[-1], data["Close"].iloc[-1]) - data["Low"].iloc[-1]) >= 2 * abs(data["Close"].iloc[-1] - data["Open"].iloc[-1]) and 
-                               (data["High"].iloc[-1] - max(data["Open"].iloc[-1], data["Close"].iloc[-1])) < (min(data["Open"].iloc[-1], data["Close"].iloc[-1]) - data["Low"].iloc[-1]) and 
-                               data["Volume"].iloc[-1] > data["前5均量"].iloc[-1] and 
-                               data["RSI"].iloc[-1] > 50)
-                morning_star = (len(data) > 2 and 
-                                data["Close"].iloc[-3] < data["Open"].iloc[-3] and 
-                                abs(data["Close"].iloc[-2] - data["Open"].iloc[-2]) < 0.3 * abs(data["Close"].iloc[-3] - data["Open"].iloc[-3]) and 
-                                data["Close"].iloc[-1] > data["Open"].iloc[-1] and 
-                                data["Close"].iloc[-1] > (data["Open"].iloc[-3] + data["Close"].iloc[-3]) / 2 and 
-                                data["Volume"].iloc[-1] > data["前5均量"].iloc[-1] and 
-                                data["RSI"].iloc[-1] < 50)
-                evening_star = (len(data) > 2 and 
-                                data["Close"].iloc[-3] > data["Open"].iloc[-3] and 
-                                abs(data["Close"].iloc[-2] - data["Open"].iloc[-2]) < 0.3 * abs(data["Close"].iloc[-3] - data["Open"].iloc[-3]) and 
-                                data["Close"].iloc[-1] < data["Open"].iloc[-1] and 
-                                data["Close"].iloc[-1] < (data["Open"].iloc[-3] + data["Close"].iloc[-3]) / 2 and 
-                                data["Volume"].iloc[-1] > data["前5均量"].iloc[-1] and 
-                                data["RSI"].iloc[-1] > 50)
-                
-                # 新增：VWAP、MFI、OBV 当前信号检测
-                vwap_buy_signal = len(data) > 1 and pd.notna(data["VWAP"].iloc[-1]) and data["Close"].iloc[-1] > data["VWAP"].iloc[-1] and data["Close"].iloc[-2] <= data["VWAP"].iloc[-2]
-                vwap_sell_signal = len(data) > 1 and pd.notna(data["VWAP"].iloc[-1]) and data["Close"].iloc[-1] < data["VWAP"].iloc[-1] and data["Close"].iloc[-2] >= data["VWAP"].iloc[-2]
-                mfi_bull_divergence = len(data) > MFI_DIVERGENCE_WINDOW and data['MFI_Bull_Div'].iloc[-1]
-                mfi_bear_divergence = len(data) > MFI_DIVERGENCE_WINDOW and data['MFI_Bear_Div'].iloc[-1]
-                obv_breakout_buy = len(data) > 1 and data["Close"].iloc[-1] > data["Close"].iloc[-2] and data["OBV"].iloc[-1] > data['OBV_Roll_Max'].iloc[-2]
-                obv_breakout_sell = len(data) > 1 and data["Close"].iloc[-1] < data["Close"].iloc[-2] and data["OBV"].iloc[-1] < data['OBV_Roll_Min'].iloc[-2]
-                
-                # 新增：VIX 当前信号检测
-                vix_panic_sell = len(data) > 1 and pd.notna(data["VIX"].iloc[-1]) and data["VIX"].iloc[-1] > VIX_HIGH_THRESHOLD and data["VIX"].iloc[-1] > data["VIX"].iloc[-2]
-                vix_calm_buy = len(data) > 1 and pd.notna(data["VIX"].iloc[-1]) and data["VIX"].iloc[-1] < VIX_LOW_THRESHOLD and data["VIX"].iloc[-1] < data["VIX"].iloc[-2]
-                
-                # 新增：VIX 趨勢当前信号检测
-                vix_uptrend_sell = len(data) > 1 and pd.notna(data["VIX_EMA_Fast"].iloc[-1]) and data["VIX_EMA_Fast"].iloc[-1] > data["VIX_EMA_Slow"].iloc[-1] and data["VIX_EMA_Fast"].iloc[-2] <= data["VIX_EMA_Slow"].iloc[-2]
-                vix_downtrend_buy = len(data) > 1 and pd.notna(data["VIX_EMA_Fast"].iloc[-1]) and data["VIX_EMA_Fast"].iloc[-1] < data["VIX_EMA_Slow"].iloc[-1] and data["VIX_EMA_Fast"].iloc[-2] >= data["VIX_EMA_Slow"].iloc[-2]
-                
-                # 跳空信号检测
-                gap_common_up = False
-                gap_common_down = False
-                gap_breakaway_up = False
-                gap_breakaway_down = False
-                gap_runaway_up = False
-                gap_runaway_down = False
-                gap_exhaustion_up = False
-                gap_exhaustion_down = False
-                if len(data) > 1:
-                    gap_pct = ((data["Open"].iloc[-1] - data["Close"].iloc[-2]) / data["Close"].iloc[-2]) * 100
-                    is_up_gap = gap_pct > GAP_THRESHOLD
-                    is_down_gap = gap_pct < -GAP_THRESHOLD
-                    if is_up_gap or is_down_gap:
-                        trend = data["Close"].iloc[-5:].mean() if len(data) >= 5 else 0
-                        prev_trend = data["Close"].iloc[-6:-1].mean() if len(data) >= 6 else trend
-                        is_up_trend = data["Close"].iloc[-1] > trend and trend > prev_trend
-                        is_down_trend = data["Close"].iloc[-1] < trend and trend < prev_trend
-                        is_high_volume = data["Volume"].iloc[-1] > data["前5均量"].iloc[-1]
-                        is_price_reversal = (len(data) > 2 and
-                                            ((is_up_gap and data["Close"].iloc[-1] < data["Close"].iloc[-2]) or
-                                             (is_down_gap and data["Close"].iloc[-1] > data["Close"].iloc[-2])))
-                        if is_up_gap:
-                            if is_price_reversal and is_high_volume:
-                                gap_exhaustion_up = True
-                            elif is_up_trend and is_high_volume:
-                                gap_runaway_up = True
-                            elif data["High"].iloc[-1] > data["High"].iloc[-2:-1].max() and is_high_volume:
-                                gap_breakaway_up = True
-                            else:
-                                gap_common_up = True
-                        elif is_down_gap:
-                            if is_price_reversal and is_high_volume:
-                                gap_exhaustion_down = True
-                            elif is_down_trend and is_high_volume:
-                                gap_runaway_down = True
-                            elif data["Low"].iloc[-1] < data["Low"].iloc[-2:-1].min() and is_high_volume:
-                                gap_breakaway_down = True
-                            else:
-                                gap_common_down = True
-
-                # 连续向上/向下信号检测
-                continuous_up_buy_signal = data['Continuous_Up'].iloc[-1] >= CONTINUOUS_UP_THRESHOLD
-                continuous_down_sell_signal = data['Continuous_Down'].iloc[-1] >= CONTINUOUS_DOWN_THRESHOLD
-
-                # SMA趋势信号检测
-                sma50_up_trend = False
-                sma50_down_trend = False
-                sma50_200_up_trend = False
-                sma50_200_down_trend = False
-                if pd.notna(data["SMA50"].iloc[-1]):
-                    if data["Close"].iloc[-1] > data["SMA50"].iloc[-1]:
-                        sma50_up_trend = True
-                    elif data["Close"].iloc[-1] < data["SMA50"].iloc[-1]:
-                        sma50_down_trend = True
-                if pd.notna(data["SMA50"].iloc[-1]) and pd.notna(data["SMA200"].iloc[-1]):
-                    if data["Close"].iloc[-1] > data["SMA50"].iloc[-1] and data["SMA50"].iloc[-1] > data["SMA200"].iloc[-1]:
-                        sma50_200_up_trend = True
-                    elif data["Close"].iloc[-1] < data["SMA50"].iloc[-1] and data["SMA50"].iloc[-1] < data["SMA200"].iloc[-1]:
-                        sma50_200_down_trend = True
-
-                # 显示当前资料
-                st.metric(f"{ticker} 🟢 股價變動", f"${current_price:.2f}",
-                          f"{price_change:.2f} ({price_pct_change:.2f}%)")
-                st.metric(f"{ticker} 🔵 成交量變動", f"{last_volume:,}",
-                          f"{volume_change:,} ({volume_pct_change:.2f}%)")
-
-                # 新增：VIX 指标显示
-                if pd.notna(data["VIX"].iloc[-1]):
-                    st.metric(f"{ticker} ⚡ VIX 恐慌指數", f"{data['VIX'].iloc[-1]:.2f}",
-                              f"{data['VIX Change %'].iloc[-1]:.2f}%" if pd.notna(data['VIX Change %'].iloc[-1]) else "N/A")
-
-                # 计算并显示所有信号的成功率
-                success_rates = calculate_signal_success_rate(data)
-                st.subheader(f"📊 {ticker} 各信号成功率")
-                success_data = []
-                for signal, metrics in success_rates.items():
-                    success_rate = metrics["success_rate"]
-                    total_signals = metrics["total_signals"]
-                    direction = metrics["direction"]
-                    success_definition = "下一交易日的最低价低于当前最低价且收盘价低于当前收盘价" if direction == "down" else "下一交易日的最高价高于当前最高价且收盘价高于当前收盘价"
-                    success_data.append({
-                        "信号": signal,
-                        "成功率 (%)": f"{success_rate:.2f}%",
-                        "触发次数": total_signals,
-                        "成功定义": success_definition
-                    })
-                    st.metric(f"{ticker} {signal} 成功率", 
-                              f"{success_rate:.2f}%",
-                              f"基于 {total_signals} 次信号 ({'下跌' if direction == 'down' else '上涨'})")
-                    if total_signals > 0 and total_signals < 5:
-                        st.warning(f"⚠️ {ticker} {signal} 样本量过少（{total_signals} 次），成功率可能不稳定")
-                
-                # 显示成功率表格
-                if success_data:
-                    st.dataframe(
-                        pd.DataFrame(success_data),
-                        use_container_width=True,
-                        column_config={
-                            "信号": st.column_config.TextColumn("信号", width="medium"),
-                            "成功率 (%)": st.column_config.TextColumn("成功率 (%)", width="small"),
-                            "触发次数": st.column_config.NumberColumn("触发次数", width="small"),
-                            "成功定义": st.column_config.TextColumn("成功定义", width="large")
-                        }
-                    )
-
-                # 新增：显示综合解读
-                st.subheader(f"📝 {ticker} 綜合解讀")
-                st.write(comprehensive_interpretation)
-
-                # 异动提醒 + Email 推播（新增 or 新信号）
-                if (abs(price_pct_change) >= PRICE_THRESHOLD and abs(volume_pct_change) >= VOLUME_THRESHOLD) or low_high_signal or high_low_signal or macd_buy_signal or macd_sell_signal or ema_buy_signal or ema_sell_signal or price_trend_buy_signal or price_trend_sell_signal or price_trend_vol_buy_signal or price_trend_vol_sell_signal or price_trend_vol_pct_buy_signal or price_trend_vol_pct_sell_signal or gap_common_up or gap_common_down or gap_breakaway_up or gap_breakaway_down or gap_runaway_up or gap_runaway_down or gap_exhaustion_up or gap_exhaustion_down or continuous_up_buy_signal or continuous_down_sell_signal or sma50_up_trend or sma50_down_trend or sma50_200_up_trend or sma50_200_down_trend or new_buy_signal or new_sell_signal or new_pivot_signal or ema10_30_buy_signal or ema10_30_40_strong_buy_signal or ema10_30_sell_signal or ema10_30_40_strong_sell_signal or bullish_engulfing or bearish_engulfing or hammer or hanging_man or morning_star or evening_star or vwap_buy_signal or vwap_sell_signal or mfi_bull_divergence or mfi_bear_divergence or obv_breakout_buy or obv_breakout_sell or vix_panic_sell or vix_calm_buy or vix_uptrend_sell or vix_downtrend_buy:
-                    alert_msg = f"{ticker} 異動：價格 {price_pct_change:.2f}%、成交量 {volume_pct_change:.2f}%"
-                    if low_high_signal:
-                        alert_msg += "，當前最低價高於前一時段最高價"
-                    if high_low_signal:
-                        alert_msg += "，當前最高價低於前一時段最低價"
-                    if macd_buy_signal:
-                        alert_msg += "，MACD 買入訊號（MACD 線由負轉正）"
-                    if macd_sell_signal:
-                        alert_msg += "，MACD 賣出訊號（MACD 線由正轉負）"
-                    if ema_buy_signal:
-                        alert_msg += "，EMA 買入訊號（EMA5 上穿 EMA10，成交量放大）"
-                    if ema_sell_signal:
-                        alert_msg += "，EMA 賣出訊號（EMA5 下破 EMA10，成交量放大）"
-                    if price_trend_buy_signal:
-                        alert_msg += "，價格趨勢買入訊號（最高價、最低價、收盤價均上漲）"
-                    if price_trend_sell_signal:
-                        alert_msg += "，價格趨勢賣出訊號（最高價、最低價、收盤價均下跌）"
-                    if price_trend_vol_buy_signal:
-                        alert_msg += "，價格趨勢買入訊號（量）（最高價、最低價、收盤價均上漲且成交量放大）"
-                    if price_trend_vol_sell_signal:
-                        alert_msg += "，價格趨勢賣出訊號（量）（最高價、最低價、收盤價均下跌且成交量放大）"
-                    if price_trend_vol_pct_buy_signal:
-                        alert_msg += "，價格趨勢買入訊號（量%）（最高價、最低價、收盤價均上漲且成交量變化 > 15%）"
-                    if price_trend_vol_pct_sell_signal:
-                        alert_msg += "，價格趨勢賣出訊號（量%）（最高價、最低價、收盤價均下跌且成交量變化 > 15%）"
-                    if gap_common_up:
-                        alert_msg += "，普通跳空(上)（價格向上跳空，未伴隨明顯趨勢或成交量放大）"
-                    if gap_common_down:
-                        alert_msg += "，普通跳空(下)（價格向下跳空，未伴隨明顯趨勢或成交量放大）"
-                    if gap_breakaway_up:
-                        alert_msg += "，突破跳空(上)（價格向上跳空，突破前高且成交量放大）"
-                    if gap_breakaway_down:
-                        alert_msg += "，突破跳空(下)（價格向下跳空，跌破前低且成交量放大）"
-                    if gap_runaway_up:
-                        alert_msg += "，持續跳空(上)（價格向上跳空，處於上漲趨勢且成交量放大）"
-                    if gap_runaway_down:
-                        alert_msg += "，持續跳空(下)（價格向下跳空，處於下跌趨勢且成交量放大）"
-                    if gap_exhaustion_up:
-                        alert_msg += "，衰竭跳空(上)（價格向上跳空，趨勢末端且隨後價格下跌，成交量放大）"
-                    if gap_exhaustion_down:
-                        alert_msg += "，衰竭跳空(下)（價格向下跳空，趨勢末端且隨後價格上漲，成交量放大）"
-                    if continuous_up_buy_signal:
-                        alert_msg += f"，連續向上策略買入訊號（至少連續 {CONTINUOUS_UP_THRESHOLD} 根K線上漲）"
-                    if continuous_down_sell_signal:
-                        alert_msg += f"，連續向下策略賣出訊號（至少連續 {CONTINUOUS_DOWN_THRESHOLD} 根K線下跌）"
-                    if sma50_up_trend:
-                        alert_msg += "，SMA50 上升趨勢（當前價格高於 SMA50）"
-                    if sma50_down_trend:
-                        alert_msg += "，SMA50 下降趨勢（當前價格低於 SMA50）"
-                    if sma50_200_up_trend:
-                        alert_msg += "，SMA50_200 上升趨勢（當前價格高於 SMA50 且 SMA50 高於 SMA200）"
-                    if sma50_200_down_trend:
-                        alert_msg += "，SMA50_200 下降趨勢（當前價格低於 SMA50 且 SMA50 低於 SMA200）"
-                    if new_buy_signal:
-                        alert_msg += "，新买入信号（今日收盘价大于开盘价且今日开盘价大于前日收盘价）"
-                    if new_sell_signal:
-                        alert_msg += "，新卖出信号（今日收盘价小于开盘价且今日开盘价小于前日收盘价）"
-                    if new_pivot_signal:
-                        alert_msg += f"，新转折点（|Price Change %| > {PRICE_CHANGE_THRESHOLD}% 且 |Volume Change %| > {VOLUME_CHANGE_THRESHOLD}%）"
-                    if ema10_30_buy_signal:
-                        alert_msg += "，EMA10_30 買入訊號（EMA10 上穿 EMA30）"
-                    if ema10_30_40_strong_buy_signal:
-                        alert_msg += "，EMA10_30_40 強烈買入訊號（EMA10 上穿 EMA30 且高於 EMA40）"
-                    if ema10_30_sell_signal:
-                        alert_msg += "，EMA10_30 賣出訊號（EMA10 下破 EMA30）"
-                    if ema10_30_40_strong_sell_signal:
-                        alert_msg += "，EMA10_30_40 強烈賣出訊號（EMA10 下破 EMA30 且低於 EMA40）"
-                    if bullish_engulfing:
-                        alert_msg += "，看漲吞沒形態（當前K線完全包圍前一根看跌K線，成交量放大）"
-                    if bearish_engulfing:
-                        alert_msg += "，看跌吞沒形態（當前K線完全包圍前一根看漲K線，成交量放大）"
-                    if hammer:
-                        alert_msg += "，錘頭線（下影線較長，買方介入，預示反轉）"
-                    if hanging_man:
-                        alert_msg += "，上吊線（下影線較長，賣方介入，預示反轉）"
-                    if morning_star:
-                        alert_msg += "，早晨之星（下跌後出現小實體K線，隨後強烈看漲K線，預示反轉）"
-                    if evening_star:
-                        alert_msg += "，黃昏之星（上漲後出現小實體K線，隨後強烈看跌K線，預示反轉）"
-                    # 新增：VWAP、MFI、OBV 描述
-                    if vwap_buy_signal:
-                        alert_msg += "，VWAP 買入訊號（價格上穿 VWAP，作為主進場基準）"
-                    if vwap_sell_signal:
-                        alert_msg += "，VWAP 賣出訊號（價格下破 VWAP，作為主出場基準）"
-                    if mfi_bull_divergence:
-                        alert_msg += "，MFI 牛背離買入（價格新低但 MFI 未新低，偵測超賣背離）"
-                    if mfi_bear_divergence:
-                        alert_msg += "，MFI 熊背離賣出（價格新高但 MFI 未新高，偵測超買背離）"
-                    if obv_breakout_buy:
-                        alert_msg += "，OBV 突破買入（OBV 新高確認價格上漲量能）"
-                    if obv_breakout_sell:
-                        alert_msg += "，OBV 突破賣出（OBV 新低確認價格下跌量能）"
-                    #add
-                    # 新增：接近成交密集區提示
-                    if near_dense:
-                        alert_msg += f"，{near_dense_info}（潛在強支撐/壓力）"
-                    # 新增：VIX 描述
-                    if vix_panic_sell:
-                        alert_msg += "，VIX 恐慌賣出（VIX > 30 且上升，市場恐慌加劇）"
-                    if vix_calm_buy:
-                        alert_msg += "，VIX 平靜買入（VIX < 20 且下降，市場穩定）"
-                    # 新增：VIX 趨勢描述
-                    if vix_uptrend_sell:
-                        alert_msg += "，VIX 上升趨勢賣出（VIX EMA5 上穿 EMA10，恐慌增加）"
-                    if vix_downtrend_buy:
-                        alert_msg += "，VIX 下降趨勢買入（VIX EMA5 下破 EMA10，市場平靜）"
-                    # 新增：加入最新K线形态到提醒
-                    if data["K線形態"].iloc[-1] != "普通K線":
-                        alert_msg += f"，最新K線形態：{data['K線形態'].iloc[-1]}（{data['單根解讀'].iloc[-1]}）"
-                    st.warning(f"📣 {alert_msg}")
-                    st.toast(f"📣 {alert_msg}")
-                    send_email_alert(ticker, price_pct_change, volume_pct_change, low_high_signal, high_low_signal, 
-                                    macd_buy_signal, macd_sell_signal, ema_buy_signal, ema_sell_signal, 
-                                    price_trend_buy_signal, price_trend_sell_signal,
-                                    price_trend_vol_buy_signal, price_trend_vol_sell_signal,
-                                    price_trend_vol_pct_buy_signal, price_trend_vol_pct_sell_signal,
-                                    gap_common_up, gap_common_down, gap_breakaway_up, gap_breakaway_down,
-                                    gap_runaway_up, gap_runaway_down, gap_exhaustion_up, gap_exhaustion_down,
-                                    continuous_up_buy_signal, continuous_down_sell_signal,
-                                    sma50_up_trend, sma50_down_trend,
-                                    sma50_200_up_trend, sma50_200_down_trend,
-                                    new_buy_signal, new_sell_signal, new_pivot_signal,
-                                    ema10_30_buy_signal, ema10_30_40_strong_buy_signal,
-                                    ema10_30_sell_signal, ema10_30_40_strong_sell_signal,
-                                    bullish_engulfing, bearish_engulfing, hammer, hanging_man,
-                                    morning_star, evening_star,
-                                    # 新增调用参数
-                                    vwap_buy_signal, vwap_sell_signal,
-                                    mfi_bull_divergence, mfi_bear_divergence,
-                                    obv_breakout_buy, obv_breakout_sell,
-                                    # 新增 VIX 参数
-                                    vix_panic_sell, vix_calm_buy,
-                                    # 新增 VIX 趨勢参数
-                                    vix_uptrend_sell, vix_downtrend_buy)
-
-                    # 修改：Telegram 發送邏輯（基於表格條件匹配）
-                    if data["Close_N_High"].iloc[-1] >=HIGH_N_HIGH_THRESHOLD:
-                            alertmsg = f"有機會再破新高,買入訊號: {data['Datetime'].iloc[-1]} {ticker}:{selected_interval}:$ {data['High'].iloc[-1].round(2)} *{data['異動標記'].iloc[-1]}*{data['成交量標記'].iloc[-1]}*{data['K線形態'].iloc[-1]}*{data['單根解讀'].iloc[-1]}* 匹配排名 {matched_rank} 條件"
-                            send_telegram_alert(alertmsg)
-                    if data["High"].iloc[-1] >= data['High_Max'].iloc[-1]:
-                            alertmsg = f"破5K新高,買入訊號: {data['Datetime'].iloc[-1]} {ticker}:{selected_interval}:$ {data['Close'].iloc[-1].round(2)} *{data['異動標記'].iloc[-1]}*{data['成交量標記'].iloc[-1]}*{data['K線形態'].iloc[-1]}*{data['單根解讀'].iloc[-1]}* 匹配排名 {matched_rank} 條件"
-                            send_telegram_alert(alertmsg)
-                    if data["Low"].iloc[-1] <= data['Low_Min'].iloc[-1]:
-                            alertmsg = f"穿5K新低,賣出訊號: {data['Datetime'].iloc[-1]} {ticker}:{selected_interval}:$ {data['Close'].iloc[-1].round(2)} *{data['異動標記'].iloc[-1]}*{data['成交量標記'].iloc[-1]}*{data['K線形態'].iloc[-1]}*{data['單根解讀'].iloc[-1]}* 匹配排名 {matched_rank} 條件"
-                            send_telegram_alert(alertmsg)
-                    if len(data["異動標記"]) > 0:
-                        K_signals = str(data["異動標記"].iloc[-1])  # 最新一根K线的信号字符串
-                        K_signals_list = [s.strip() for s in K_signals.split(", ") if s.strip()]  # 拆分並過濾空
-                        current_volume_mark = data["成交量標記"].iloc[-1]
-                        current_kline_pattern = data["K線形態"].iloc[-1]
-                        ###
-                        # if data["Close_N_High"].iloc[-1] >=HIGH_N_HIGH_THRESHOLD:
-                        #     alertmsg = f"有機會再破新高,買入訊號: {data['Datetime'].iloc[-1]} {ticker}:{selected_interval}:$ {data['High'].iloc[-1].round(2)} *{data['異動標記'].iloc[-1]}*{data['成交量標記'].iloc[-1]}*{data['K線形態'].iloc[-1]}*{data['單根解讀'].iloc[-1]}* 匹配排名 {matched_rank} 條件"
-                        #     send_telegram_alert(alertmsg)
-                        # if data["High"].iloc[-1] > data['High_Max'].iloc[-1]:
-                        #     alertmsg = f"破5K新高,買入訊號: {data['Datetime'].iloc[-1]} {ticker}:{selected_interval}:$ {data['Close'].iloc[-1].round(2)} *{data['異動標記'].iloc[-1]}*{data['成交量標記'].iloc[-1]}*{data['K線形態'].iloc[-1]}*{data['單根解讀'].iloc[-1]}* 匹配排名 {matched_rank} 條件"
-                        #     send_telegram_alert(alertmsg)
-                        # if data["Low"].iloc[-1] < data['Low_Min'].iloc[-1]:
-                        #     alertmsg = f"穿5K新低,賣出訊號: {data['Datetime'].iloc[-1]} {ticker}:{selected_interval}:$ {data['Close'].iloc[-1].round(2)} *{data['異動標記'].iloc[-1]}*{data['成交量標記'].iloc[-1]}*{data['K線形態'].iloc[-1]}*{data['單根解讀'].iloc[-1]}* 匹配排名 {matched_rank} 條件"
-                        #     send_telegram_alert(alertmsg)
-
-
-                        matched_rank = None
-                        for idx, row in telegram_conditions.iterrows():
-                            required_signals = [s.strip() for s in str(row["異動標記"]).split(", ") if s.strip()]
-                            required_volume = row["成交量標記"]
-                            required_pattern = row["K線形態"]
-                            
-                            if (all(sig in K_signals_list for sig in required_signals) and
-                                current_volume_mark == required_volume and
-                                current_kline_pattern == required_pattern):
-                                matched_rank = row["排名"]
-                                break
-                        
-                        if matched_rank is not None:
-                            alertmsg = f"1D BUY 趨勢反轉,買入訊號: {data['Datetime'].iloc[-1]} {ticker}:{selected_interval}:$ {data['Close'].iloc[-1].round(2)} *{data['異動標記'].iloc[-1]}*{data['成交量標記'].iloc[-1]}*{data['K線形態'].iloc[-1]}*{data['單根解讀'].iloc[-1]}* 匹配排名 {matched_rank} 條件"
-                            send_telegram_alert(alertmsg)
-                    ##########
-                # 添加 K 线图（含 EMA）、成交量柱状图和 RSI 子图（新增 VWAP/MFI/OBV traces）
-                st.subheader(f"📈 {ticker} K線圖與技術指標")
-                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-                fig = make_subplots(rows=3, cols=1, shared_xaxes=True, 
-                                    subplot_titles=(f"{ticker} K線與EMA/VWAP", "成交量/OBV", "RSI/MFI"),
-                                    vertical_spacing=0.1, row_heights=[0.5, 0.2, 0.3])
-                
-                # 添加 K 线图
-                fig.add_trace(go.Candlestick(x=data.tail(10)["Datetime"],
-                                            open=data.tail(10)["Open"],
-                                            high=data.tail(10)["High"],
-                                            low=data.tail(10)["Low"],
-                                            close=data.tail(10)["Close"],
-                                            name="K線"), row=1, col=1)
-                
-                # 添加 EMA5、EMA10、EMA30 和 EMA40
-                fig.add_trace(px.line(data.tail(10), x="Datetime", y="EMA5")["data"][0], row=1, col=1)
-                fig.add_trace(px.line(data.tail(10), x="Datetime", y="EMA10")["data"][0], row=1, col=1)
-                fig.add_trace(px.line(data.tail(10), x="Datetime", y="EMA30")["data"][0], row=1, col=1)
-                fig.add_trace(px.line(data.tail(10), x="Datetime", y="EMA40")["data"][0], row=1, col=1)
-                
-                # 新增：VWAP 線（主圖）
-                fig.add_trace(go.Scatter(x=data.tail(10)["Datetime"], y=data.tail(10)["VWAP"], 
-                                         mode='lines', name='VWAP', line=dict(color='purple', width=2)), row=1, col=1)
-                #add
-                # 新增：畫成交密集區水平區域（半透明矩形）
-                if VOLUME_PROFILE_SHOW_ON_CHART and dense_areas:
-                    for area in dense_areas:
-                        fig.add_hrect(
-                            y0=area['price_low'],
-                            y1=area['price_high'],
-                            x0=data['Datetime'].iloc[-50],  # 從最近50根開始畫
-                            x1=data['Datetime'].iloc[-1],
-                            fillcolor="rgba(255, 165, 0, 0.15)",  # 半透明橙色
-                            line_width=0,
-                            row=1, col=1
-                        )
-                        # 標記中心價格線（較粗）
-                        for i, area in enumerate(dense_areas):
-                            # 奇數個放左邊，偶數個放右邊
-                            position = "left" if i % 2 == 0 else "right"
-                            
-                            fig.add_hline(
-                                y=area['price_center'],
-                                line_dash="dot",
-                                line_color="red",
-                                annotation_text=f"{area['price_center']:.2f}",
-                                annotation_position=position,
-                                annotation_font=dict(color="red", size=12),
-                                row=1, col=1
-                            )
-                        # fig.add_hline(
-                        #     y=area['price_center'],
-                        #     line_dash="dot",
-                        #     line_color="orange",
-                        #     annotation_text=f"密集區 {area['price_center']:.2f}",
-                        #     annotation_position="right",
-                        #     annotation_font=dict(color="red", size=24),
-                        #     row=1, col=1
-                        # )
-
-
-                # 添加成交量柱状图
-                fig.add_bar(x=data.tail(10)["Datetime"], y=data.tail(10)["Volume"], 
-                           name="成交量", opacity=0.5, row=2, col=1)
-                
-                # 新增：OBV 線（成交量子圖，secondary_y）
-                fig.add_trace(go.Scatter(x=data.tail(10)["Datetime"], y=data.tail(10)["OBV"], 
-                                         mode='lines', name='OBV', yaxis="y2", line=dict(color='orange', width=2)), row=2, col=1)
-                fig.add_hline(y=0, line_dash="dash", line_color="black", row=2, col=1)
-                fig.update_layout(yaxis2=dict(overlaying="y", side="right", title="OBV"))
-                
-                # 添加 RSI 子图
-                fig.add_trace(px.line(data.tail(10), x="Datetime", y="RSI")["data"][0], row=3, col=1)
-                fig.add_hline(y=70, line_dash="dash", line_color="red", row=3, col=1)  # 超买线
-                fig.add_hline(y=30, line_dash="dash", line_color="green", row=3, col=1)  # 超卖线
-                
-                # 新增：MFI 線（RSI子圖，secondary_y）
-                fig.add_trace(go.Scatter(x=data.tail(10)["Datetime"], y=data.tail(10)["MFI"], 
-                                         mode='lines', name='MFI', yaxis="y3", line=dict(color='brown', width=2)), row=3, col=1)
-                fig.add_hline(y=80, line_dash="dash", line_color="red", row=3, col=1, yref="y3")  # MFI超买
-                fig.add_hline(y=20, line_dash="dash", line_color="green", row=3, col=1, yref="y3")  # MFI超卖
-                fig.update_layout(yaxis3=dict(overlaying="y", side="right", title="MFI", range=[0,100]))
-                
-                # 标记 EMA 买入/卖出信号、关键转折点、新买入信号、新卖出信号、新转折点及新EMA信号
-                for i in range(1, len(data.tail(10))):
-                    idx = -10 + i  # 调整索引以匹配 tail(10)
-                    if (data["EMA5"].iloc[idx] > data["EMA10"].iloc[idx] and 
-                        data["EMA5"].iloc[idx-1] <= data["EMA10"].iloc[idx-1]):
-                        fig.add_annotation(x=data["Datetime"].iloc[idx], y=data["Close"].iloc[idx],
-                                         text="📈 EMA買入", showarrow=True, arrowhead=2, ax=20, ay=-30, row=1, col=1)
-                    elif (data["EMA5"].iloc[idx] < data["EMA10"].iloc[idx] and 
-                          data["EMA5"].iloc[idx-1] >= data["EMA10"].iloc[idx-1]):
-                        fig.add_annotation(x=data["Datetime"].iloc[idx], y=data["Close"].iloc[idx],
-                                         text="📉 EMA賣出", showarrow=True, arrowhead=2, ax=20, ay=30, row=1, col=1)
-                    if "关键转折点" in data["異動標記"].iloc[idx]:
-                        fig.add_scatter(x=[data["Datetime"].iloc[idx]], y=[data["Close"].iloc[idx]],
-                                       mode="markers+text", marker=dict(symbol="star", size=12, color="yellow"),
-                                       text=[f"🔥 转折点 ${data['Close'].iloc[idx]:.2f}"],
-                                       textposition="top center", name="关键转折点", row=1, col=1)
-                    if "新买入信号" in data["異動標記"].iloc[idx]:
-                        fig.add_scatter(x=[data["Datetime"].iloc[idx]], y=[data["Close"].iloc[idx]],
-                                       mode="markers+text", marker=dict(symbol="triangle-up", size=10, color="green"),
-                                       text=[f"📈 新买入 ${data['Close'].iloc[idx]:.2f}"],
-                                       textposition="bottom center", name="新买入信号", row=1, col=1)
-                    if "新卖出信号" in data["異動標記"].iloc[idx]:
-                        fig.add_scatter(x=[data["Datetime"].iloc[idx]], y=[data["Close"].iloc[idx]],
-                                       mode="markers+text", marker=dict(symbol="triangle-down", size=10, color="red"),
-                                       text=[f"📉 新卖出 ${data['Close'].iloc[idx]:.2f}"],
-                                       textposition="top center", name="新卖出信号", row=1, col=1)
-                    if "新转折点" in data["異動標記"].iloc[idx]:
-                        fig.add_scatter(x=[data["Datetime"].iloc[idx]], y=[data["Close"].iloc[idx]],
-                                       mode="markers+text", marker=dict(symbol="star", size=10, color="purple"),
-                                       text=[f"🔄 新转折点 ${data['Close'].iloc[idx]:.2f}"],
-                                       textposition="top center", name="新转折点", row=1, col=1)
-                    if "EMA10_30買入" in data["異動標記"].iloc[idx]:
-                        fig.add_annotation(x=data["Datetime"].iloc[idx], y=data["Close"].iloc[idx],
-                                         text="📈 EMA10_30買入", showarrow=True, arrowhead=2, ax=20, ay=-30, row=1, col=1)
-                    if "EMA10_30_40強烈買入" in data["異動標記"].iloc[idx]:
-                        fig.add_annotation(x=data["Datetime"].iloc[idx], y=data["Close"].iloc[idx],
-                                         text="📈 EMA10_30_40強烈買入", showarrow=True, arrowhead=2, ax=20, ay=-50, row=1, col=1)
-                    if "EMA10_30賣出" in data["異動標記"].iloc[idx]:
-                        fig.add_annotation(x=data["Datetime"].iloc[idx], y=data["Close"].iloc[idx],
-                                         text="📉 EMA10_30賣出", showarrow=True, arrowhead=2, ax=20, ay=30, row=1, col=1)
-                    if "EMA10_30_40強烈賣出" in data["異動標記"].iloc[idx]:
-                        fig.add_annotation(x=data["Datetime"].iloc[idx], y=data["Close"].iloc[idx],
-                                         text="📉 EMA10_30_40強烈賣出", showarrow=True, arrowhead=2, ax=20, ay=50, row=1, col=1)
-                    if "看漲吞沒" in data["異動標記"].iloc[idx]:
-                        fig.add_annotation(x=data["Datetime"].iloc[idx], y=data["Close"].iloc[idx],
-                                         text="📈 看漲吞沒", showarrow=True, arrowhead=2, ax=20, ay=-30, row=1, col=1)
-                    if "看跌吞沒" in data["異動標記"].iloc[idx]:
-                        fig.add_annotation(x=data["Datetime"].iloc[idx], y=data["Close"].iloc[idx],
-                                         text="📉 看跌吞沒", showarrow=True, arrowhead=2, ax=20, ay=30, row=1, col=1)
-                    if "錘頭線" in data["異動標記"].iloc[idx]:
-                        fig.add_annotation(x=data["Datetime"].iloc[idx], y=data["Close"].iloc[idx],
-                                         text="📈 錘頭線", showarrow=True, arrowhead=2, ax=20, ay=-30, row=1, col=1)
-                    if "上吊線" in data["異動標記"].iloc[idx]:
-                        fig.add_annotation(x=data["Datetime"].iloc[idx], y=data["Close"].iloc[idx],
-                                         text="📉 上吊線", showarrow=True, arrowhead=2, ax=20, ay=30, row=1, col=1)
-                    if "早晨之星" in data["異動標記"].iloc[idx]:
-                        fig.add_annotation(x=data["Datetime"].iloc[idx], y=data["Close"].iloc[idx],
-                                         text="📈 早晨之星", showarrow=True, arrowhead=2, ax=20, ay=-30, row=1, col=1)
-                    if "黃昏之星" in data["異動標記"].iloc[idx]:
-                        fig.add_annotation(x=data["Datetime"].iloc[idx], y=data["Close"].iloc[idx],
-                                         text="📉 黃昏之星", showarrow=True, arrowhead=2, ax=20, ay=30, row=1, col=1)
-                    # 新增：标记新信号
-                    if "📈 VWAP買入" in data["異動標記"].iloc[idx]:
-                        fig.add_annotation(x=data["Datetime"].iloc[idx], y=data["Close"].iloc[idx],
-                                         text="📈 VWAP買入", showarrow=True, arrowhead=2, ax=20, ay=-30, row=1, col=1)
-                    if "📉 VWAP賣出" in data["異動標記"].iloc[idx]:
-                        fig.add_annotation(x=data["Datetime"].iloc[idx], y=data["Close"].iloc[idx],
-                                         text="📉 VWAP賣出", showarrow=True, arrowhead=2, ax=20, ay=30, row=1, col=1)
-                    if "📈 MFI牛背離買入" in data["異動標記"].iloc[idx]:
-                        fig.add_annotation(x=data["Datetime"].iloc[idx], y=data["Close"].iloc[idx],
-                                         text="📈 MFI牛背離", showarrow=True, arrowhead=2, ax=20, ay=-30, row=3, col=1)
-                    if "📉 MFI熊背離賣出" in data["異動標記"].iloc[idx]:
-                        fig.add_annotation(x=data["Datetime"].iloc[idx], y=data["Close"].iloc[idx],
-                                         text="📉 MFI熊背離", showarrow=True, arrowhead=2, ax=20, ay=30, row=3, col=1)
-                    if "📈 OBV突破買入" in data["異動標記"].iloc[idx]:
-                        fig.add_annotation(x=data["Datetime"].iloc[idx], y=data["Close"].iloc[idx],
-                                         text="📈 OBV突破", showarrow=True, arrowhead=2, ax=20, ay=-30, row=2, col=1)
-                    if "📉 OBV突破賣出" in data["異動標記"].iloc[idx]:
-                        fig.add_annotation(x=data["Datetime"].iloc[idx], y=data["Close"].iloc[idx],
-                                         text="📉 OBV突破", showarrow=True, arrowhead=2, ax=20, ay=30, row=2, col=1)
-                    # 新增：VIX 标记
-                    if "📉 VIX恐慌賣出" in data["異動標記"].iloc[idx]:
-                        fig.add_annotation(x=data["Datetime"].iloc[idx], y=data["Close"].iloc[idx],
-                                         text="📉 VIX恐慌", showarrow=True, arrowhead=2, ax=20, ay=30, row=1, col=1)
-                    if "📈 VIX平靜買入" in data["異動標記"].iloc[idx]:
-                        fig.add_annotation(x=data["Datetime"].iloc[idx], y=data["Close"].iloc[idx],
-                                         text="📈 VIX平靜", showarrow=True, arrowhead=2, ax=20, ay=-30, row=1, col=1)
-                    # 新增：VIX 趨勢标记
-                    if "📉 VIX上升趨勢賣出" in data["異動標記"].iloc[idx]:
-                        fig.add_annotation(x=data["Datetime"].iloc[idx], y=data["Close"].iloc[idx],
-                                         text="📉 VIX上升", showarrow=True, arrowhead=2, ax=20, ay=30, row=1, col=1)
-                    if "📈 VIX下降趨勢買入" in data["異動標記"].iloc[idx]:
-                        fig.add_annotation(x=data["Datetime"].iloc[idx], y=data["Close"].iloc[idx],
-                                         text="📈 VIX下降", showarrow=True, arrowhead=2, ax=20, ay=-30, row=1, col=1)
-                
-                fig.update_layout(yaxis_title="價格", yaxis2_title="成交量", yaxis3_title="RSI", showlegend=True)
-                st.plotly_chart(fig, use_container_width=True, key=f"chart_{ticker}_{timestamp}")
-
-                # 合并显示五项指标前 X% 的范围到表格
-                st.subheader(f"📊 {ticker} 前 {PERCENTILE_THRESHOLD}% 數據範圍")
-                range_data = []
-                
-                # Price Change % 范围
-                sorted_price_changes = data["Price Change %"].dropna().sort_values(ascending=False)
-                if len(sorted_price_changes) > 0:
-                    top_percent_count = max(1, int(len(sorted_price_changes) * PERCENTILE_THRESHOLD / 100))
-                    top_percent = sorted_price_changes.head(top_percent_count)
-                    range_data.append({
-                        "指標": "Price Change %",
-                        "範圍類型": "最高到最低",
-                        "最大值": f"{top_percent.max():.2f}%",
-                        "最小值": f"{top_percent.min():.2f}%"
-                    })
-                sorted_price_changes_asc = data["Price Change %"].dropna().sort_values(ascending=True)
-                if len(sorted_price_changes_asc) > 0:
-                    bottom_percent_count = max(1, int(len(sorted_price_changes_asc) * PERCENTILE_THRESHOLD / 100))
-                    bottom_percent = sorted_price_changes_asc.head(bottom_percent_count)
-                    range_data.append({
-                        "指標": "Price Change %",
-                        "範圍類型": "最低到最高",
-                        "最大值": f"{bottom_percent.max():.2f}%",
-                        "最小值": f"{bottom_percent.min():.2f}%"
-                    })
-
-                # Volume Change % 范围
-                sorted_volume_changes = data["Volume Change %"].dropna().sort_values(ascending=False)
-                if len(sorted_volume_changes) > 0:
-                    top_volume_percent_count = max(1, int(len(sorted_volume_changes) * PERCENTILE_THRESHOLD / 100))
-                    top_volume_percent = sorted_volume_changes.head(top_volume_percent_count)
-                    range_data.append({
-                        "指標": "Volume Change %",
-                        "範圍類型": "最高到最低",
-                        "最大值": f"{top_volume_percent.max():.2f}%",
-                        "最小值": f"{top_volume_percent.min():.2f}%"
-                    })
-                sorted_volume_changes_asc = data["Volume Change %"].dropna().sort_values(ascending=True)
-                if len(sorted_volume_changes_asc) > 0:
-                    bottom_volume_percent_count = max(1, int(len(sorted_volume_changes_asc) * PERCENTILE_THRESHOLD / 100))
-                    bottom_volume_percent = sorted_volume_changes_asc.head(bottom_volume_percent_count)
-                    range_data.append({
-                        "指標": "Volume Change %",
-                        "範圍類型": "最低到最高",
-                        "最大值": f"{bottom_volume_percent.max():.2f}%",
-                        "最小值": f"{bottom_volume_percent.min():.2f}%"
-                    })
-
-                # Volume 范围
-                sorted_volumes = data["Volume"].dropna().sort_values(ascending=False)
-                if len(sorted_volumes) > 0:
-                    top_volume_abs_count = max(1, int(len(sorted_volumes) * PERCENTILE_THRESHOLD / 100))
-                    top_volume_abs = sorted_volumes.head(top_volume_abs_count)
-                    range_data.append({
-                        "指標": "Volume",
-                        "範圍類型": "最高到最低",
-                        "最大值": f"{int(top_volume_abs.max()):,}",
-                        "最小值": f"{int(top_volume_abs.min()):,}"
-                    })
-                sorted_volumes_asc = data["Volume"].dropna().sort_values(ascending=True)
-                if len(sorted_volumes_asc) > 0:
-                    bottom_volume_abs_count = max(1, int(len(sorted_volumes_asc) * PERCENTILE_THRESHOLD / 100))
-                    bottom_volume_abs = sorted_volumes_asc.head(bottom_volume_abs_count)
-                    range_data.append({
-                        "指標": "Volume",
-                        "範圍類型": "最低到最高",
-                        "最大值": f"{int(bottom_volume_abs.max()):,}",
-                        "最小值": f"{int(bottom_volume_abs.min()):,}"
-                    })
-
-                # 📈 股價漲跌幅 (%) 范围
-                sorted_price_change_abs = data["📈 股價漲跌幅 (%)"].dropna().sort_values(ascending=False)
-                if len(sorted_price_change_abs) > 0:
-                    top_price_change_abs_count = max(1, int(len(sorted_price_change_abs) * PERCENTILE_THRESHOLD / 100))
-                    top_price_change_abs = sorted_price_change_abs.head(top_price_change_abs_count)
-                    range_data.append({
-                        "指標": "📈 股價漲跌幅 (%)",
-                        "範圍類型": "最高到最低",
-                        "最大值": f"{top_price_change_abs.max():.2f}%",
-                        "最小值": f"{top_price_change_abs.min():.2f}%"
-                    })
-                sorted_price_change_abs_asc = data["📈 股價漲跌幅 (%)"].dropna().sort_values(ascending=True)
-                if len(sorted_price_change_abs_asc) > 0:
-                    bottom_price_change_abs_count = max(1, int(len(sorted_price_change_abs_asc) * PERCENTILE_THRESHOLD / 100))
-                    bottom_price_change_abs = sorted_price_change_abs_asc.head(bottom_price_change_abs_count)
-                    range_data.append({
-                        "指標": "📈 股價漲跌幅 (%)",
-                        "範圍類型": "最低到最高",
-                        "最大值": f"{bottom_price_change_abs.max():.2f}%",
-                        "最小值": f"{bottom_price_change_abs.min():.2f}%"
-                    })
-
-                # 📊 成交量變動幅 (%) 范围
-                sorted_volume_change_abs = data["📊 成交量變動幅 (%)"].dropna().sort_values(ascending=False)
-                if len(sorted_volume_change_abs) > 0:
-                    top_volume_change_abs_count = max(1, int(len(sorted_volume_change_abs) * PERCENTILE_THRESHOLD / 100))
-                    top_volume_change_abs = sorted_volume_change_abs.head(top_volume_change_abs_count)
-                    range_data.append({
-                        "指標": "📊 成交量變動幅 (%)",
-                        "範圍類型": "最高到最低",
-                        "最大值": f"{top_volume_change_abs.max():.2f}%",
-                        "最小值": f"{top_volume_change_abs.min():.2f}%"
-                    })
-                sorted_volume_change_abs_asc = data["📊 成交量變動幅 (%)"].dropna().sort_values(ascending=True)
-                if len(sorted_volume_change_abs_asc) > 0:
-                    bottom_volume_change_abs_count = max(1, int(len(sorted_volume_change_abs_asc) * PERCENTILE_THRESHOLD / 100))
-                    bottom_volume_change_abs = sorted_volume_change_abs_asc.head(bottom_volume_change_abs_count)
-                    range_data.append({
-                        "指標": "📊 成交量變動幅 (%)",
-                        "範圍類型": "最低到最高",
-                        "最大值": f"{bottom_volume_change_abs.max():.2f}%",
-                        "最小值": f"{bottom_volume_change_abs.min():.2f}%"
-                    })
-
-                # 创建并显示合并表格
-                if range_data:
-                    range_df = pd.DataFrame(range_data)
-                    st.dataframe(
-                        range_df,
-                        use_container_width=True,
-                        column_config={
-                            "指標": st.column_config.TextColumn("指標", width="medium"),
-                            "範圍類型": st.column_config.TextColumn("範圍類型", width="medium"),
-                            "最大值": st.column_config.TextColumn("最大值", width="small"),
-                            "最小值": st.column_config.TextColumn("最小值", width="small")
-                        }
-                    )
-                else:
-                    st.write("無有效數據範圍可顯示")
-
-                # 显示含异动标记的历史资料（新增列：VWAP, MFI, OBV, VIX, VIX_EMA_Fast, VIX_EMA_Slow）
-                st.subheader(f"📋 歷史資料：{ticker}")
-                display_data = data[["Datetime","Open","Low","High", "Close", "Volume", "Price Change %", 
-                                     "Volume Change %", "📈 股價漲跌幅 (%)", 
-                                     "📊 成交量變動幅 (%)","Close_Difference", "異動標記",
-                                     "成交量標記", "K線形態", "單根解讀", "VWAP", "MFI", "OBV", "VIX", "VIX_EMA_Fast", "VIX_EMA_Slow"]].tail(10)
-                #add
-                if near_dense:
-                    st.info(f"⚠️ {ticker} 目前靠近成交密集區：{near_dense_info}")
-                if not display_data.empty:
-                    st.dataframe(
-                        display_data,
-                        height=600,
-                        use_container_width=True,
-                        column_config={
-                            "異動標記": st.column_config.TextColumn(width="large"),
-                            "單根解讀": st.column_config.TextColumn(width="large")
-                        }
-                    )
-                else:
-                    st.warning(f"⚠️ {ticker} 歷史數據表無內容可顯示")
-
-                # 添加下载按钮
-                csv = data.to_csv(index=False)
-                st.download_button(
-                    label=f"📥 下載 {ticker} 數據 (CSV)",
-                    data=csv,
-                    file_name=f"{ticker}_數據_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                    mime="text/csv",
-                )
-
-            except Exception as e:
-                st.warning(f"⚠️ 無法取得 {ticker} 的資料：{e}，將跳過此股票")
+@st.cache_data(ttl=120)
+def fetch_market_data() -> dict:
+    """抓取大盤環境數據，快取 2 分鐘"""
+    result = {}
+    for ticker, (name, key) in MARKET_TICKERS.items():
+        try:
+            df = yf.download(ticker, period="5d", interval="1d",
+                             auto_adjust=True, progress=False)
+            if df.empty:
                 continue
+            df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+            last  = float(df["Close"].iloc[-1])
+            prev  = float(df["Close"].iloc[-2]) if len(df) > 1 else last
+            chg   = last - prev
+            pct   = chg / prev * 100 if prev else 0
+            result[key] = {"name": name, "ticker": ticker,
+                           "last": last, "chg": chg, "pct": pct}
+        except Exception:
+            pass
+    return result
 
-        st.markdown("---")
-        st.info("📡 頁面將在 5 分鐘後自動刷新...")
+@st.cache_data(ttl=120)
+def fetch_vix_history() -> pd.Series:
+    """VIX 近 30 日歷史，用於趨勢判斷"""
+    try:
+        df = yf.download("^VIX", period="30d", interval="1d",
+                         auto_adjust=True, progress=False)
+        df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+        return df["Close"].dropna()
+    except Exception:
+        return pd.Series(dtype=float)
 
-    time.sleep(REFRESH_INTERVAL)
-    placeholder.empty()
+def get_vix_regime(vix: float) -> tuple:
+    """回傳 (狀態描述, 顏色, 條寬%) """
+    if vix < 13:   return ("超低波動 😴",  "#00ee66", 10)
+    if vix < 18:   return ("低波動 ✅",     "#88ff44", 25)
+    if vix < 25:   return ("正常範圍 🟡",  "#ffcc00", 45)
+    if vix < 30:   return ("偏高警戒 🟠",  "#ff8800", 62)
+    if vix < 40:   return ("恐慌模式 🔴",  "#ff4444", 78)
+    return             ("極度恐慌 💀",    "#cc0000", 95)
+
+@st.cache_data(ttl=300)
+def fetch_news(query: str = "US stock market", max_items: int = 8) -> list:
+    """
+    用 Yahoo Finance RSS 抓取財經新聞。
+    回傳 list of dict: {title, link, pubdate, sentiment}
+    """
+    import re, html
+    feeds = [
+        f"https://feeds.finance.yahoo.com/rss/2.0/headline?s=SPY,QQQ,^VIX&region=US&lang=en-US",
+        "https://feeds.finance.yahoo.com/rss/2.0/headline?s=AAPL,TSLA,NVDA&region=US&lang=en-US",
+    ]
+    items = []
+    bear_kw = ["crash","fall","drop","decline","slump","fear","recession",
+               "inflation","rate hike","sell-off","warning","risk","loss","down"]
+    bull_kw = ["rally","surge","gain","rise","record","growth","beat","strong",
+               "upgrade","buy","bull","positive","profit","up"]
+
+    for feed_url in feeds:
+        try:
+            resp = requests.get(feed_url, timeout=6,
+                                headers={"User-Agent": "Mozilla/5.0"})
+            titles = re.findall(r"<title><!\[CDATA\[(.*?)\]\]></title>", resp.text)
+            links  = re.findall(r"<link>(https?://.*?)</link>",           resp.text)
+            dates  = re.findall(r"<pubDate>(.*?)</pubDate>",              resp.text)
+            for i, title in enumerate(titles[1:], 0):  # skip channel title
+                if len(items) >= max_items: break
+                title = html.unescape(title).strip()
+                link  = links[i] if i < len(links) else "#"
+                date  = dates[i] if i < len(dates) else ""
+                tl    = title.lower()
+                if   any(w in tl for w in bear_kw): sent = "bear"
+                elif any(w in tl for w in bull_kw): sent = "bull"
+                else:                                sent = "neu"
+                items.append({"title": title, "link": link,
+                               "date": date[:16], "sentiment": sent})
+        except Exception:
+            pass
+        if len(items) >= max_items:
+            break
+    return items
+
+def calc_sentiment_score(mkt: dict, vix_hist: pd.Series) -> dict:
+    """
+    綜合情緒分數計算（0-100，50為中性）
+    組成：
+      40% VIX 壓力（VIX 低 → 分數高）
+      30% SPY 動能（近5日漲跌）
+      30% QQQ 動能
+    """
+    score = 50.0  # 預設中性
+
+    # VIX 分量（反向：VIX 越高 → 越恐慌 → 分數越低）
+    vix_now = mkt.get("vix", {}).get("last", 20)
+    if vix_now:
+        vix_score = max(0, min(100, 100 - (vix_now - 10) * 3.5))
+        score = score * 0.6 + vix_score * 0.4
+
+    # SPY 動能分量
+    spy = mkt.get("spy", {})
+    if spy:
+        spy_score = 50 + spy.get("pct", 0) * 8
+        spy_score = max(0, min(100, spy_score))
+        score = score * 0.7 + spy_score * 0.3
+
+    # QQQ 動能分量
+    qqq = mkt.get("qqq", {})
+    if qqq:
+        qqq_score = 50 + qqq.get("pct", 0) * 8
+        qqq_score = max(0, min(100, qqq_score))
+        score = score * 0.7 + qqq_score * 0.3
+
+    # VIX 趨勢加減分
+    if len(vix_hist) >= 5:
+        vix_5d_chg = float(vix_hist.iloc[-1] - vix_hist.iloc[-5])
+        score += -vix_5d_chg * 1.2  # VIX 5日上升 → 扣分
+
+    score = max(0, min(100, score))
+
+    if score >= 70:   label, color = "貪婪 🤑",    "#00ee66"
+    elif score >= 55: label, color = "樂觀 😊",    "#88ff44"
+    elif score >= 45: label, color = "中性 😐",    "#ffcc00"
+    elif score >= 30: label, color = "悲觀 😟",    "#ff8800"
+    else:             label, color = "極度恐慌 😱", "#ff4444"
+
+    return {"score": round(score, 1), "label": label, "color": color}
+
+def render_market_environment():
+    """渲染市場環境面板（大盤 + VIX + 情緒 + 新聞）"""
+    st.markdown("---")
+    st.subheader("🌐 市場環境總覽")
+
+    mkt      = fetch_market_data()
+    vix_hist = fetch_vix_history()
+
+    # ── 第一行：大盤指數卡片 ─────────────────────────────────────────────
+    card_keys = ["spy", "qqq", "dia", "gld", "uup", "tnx"]
+    card_cols = st.columns(len(card_keys))
+    for col, key in zip(card_cols, card_keys):
+        d = mkt.get(key)
+        with col:
+            if not d:
+                st.metric(key.upper(), "N/A")
+                continue
+            chg_str = f"{d['chg']:+.2f} ({d['pct']:+.2f}%)"
+            st.metric(d["name"], f"{d['last']:.2f}", chg_str)
+
+    st.markdown("")
+
+    # ── 第二行：VIX 壓力計 + 情緒儀表 ──────────────────────────────────
+    col_vix, col_sent, col_news_hd = st.columns([1, 1, 2])
+
+    with col_vix:
+        vix_d = mkt.get("vix", {})
+        vix_now = vix_d.get("last", 20)
+        vix_chg = vix_d.get("pct", 0)
+        regime, bar_color, bar_pct = get_vix_regime(vix_now)
+
+        st.markdown(f"""
+        <div class="mkt-panel">
+          <div class="mkt-title">😨 VIX 恐慌指數</div>
+          <div style="font-size:2rem;font-weight:800;color:{'#ff4444' if vix_now>25 else '#ffcc00' if vix_now>18 else '#00ee66'}">
+            {vix_now:.2f}
+            <span style="font-size:0.85rem;color:{'#ff4455' if vix_chg>0 else '#00ee66'}">
+              {'▲' if vix_chg>0 else '▼'} {abs(vix_chg):.2f}%
+            </span>
+          </div>
+          <div class="vix-bar-bg">
+            <div class="vix-bar-fill" style="width:{bar_pct}%;background:{bar_color};"></div>
+          </div>
+          <div style="font-size:0.85rem;color:{bar_color};margin-top:4px;">{regime}</div>
+          <div style="font-size:0.72rem;color:#556688;margin-top:6px;">
+            &lt;18 正常　18-25 警戒　&gt;30 恐慌
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # VIX 近期走勢迷你圖
+        if len(vix_hist) >= 5:
+            vix_fig = go.Figure(go.Scatter(
+                y=vix_hist.values, mode="lines+markers",
+                line=dict(color=bar_color, width=2),
+                marker=dict(size=4),
+                fill="tozeroy", fillcolor=f"rgba(255,100,100,0.08)",
+            ))
+            vix_fig.update_layout(
+                height=100, margin=dict(l=0,r=0,t=0,b=0),
+                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                showlegend=False, xaxis=dict(visible=False),
+                yaxis=dict(showgrid=False, tickfont=dict(size=9, color="#556688")),
+            )
+            st.plotly_chart(vix_fig, use_container_width=True,
+                            config={"displayModeBar": False}, key="vix_mini")
+
+    with col_sent:
+        sent = calc_sentiment_score(mkt, vix_hist)
+        sc   = sent["score"]
+        sc_color = sent["color"]
+
+        # 各分項指標
+        indicators = []
+        if mkt.get("spy"):
+            pct = mkt["spy"]["pct"]
+            indicators.append(("SPY 動能", 50 + pct*8, "#4488ff"))
+        if mkt.get("qqq"):
+            pct = mkt["qqq"]["pct"]
+            indicators.append(("QQQ 動能", 50 + pct*8, "#aa44ff"))
+        vix_comp = max(0, min(100, 100-(vix_now-10)*3.5)) if vix_now else 50
+        indicators.append(("VIX 壓力", vix_comp, "#ff8844"))
+        if mkt.get("tnx"):
+            tnx_pct = mkt["tnx"]["pct"]
+            bond_score = max(0, min(100, 50 - tnx_pct*6))
+            indicators.append(("債券安全", bond_score, "#44ccff"))
+
+        meter_rows = ""
+        for name, val, color in indicators:
+            val = max(0, min(100, val))
+            meter_rows += f"""
+            <div class="sentiment-meter">
+              <span class="sentiment-label">{name}</span>
+              <div class="sentiment-bar-bg">
+                <div class="sentiment-bar-fill" style="width:{val:.0f}%;background:{color};"></div>
+              </div>
+              <span class="sentiment-val" style="color:{color}">{val:.0f}</span>
+            </div>"""
+
+        st.markdown(f"""
+        <div class="mkt-panel">
+          <div class="mkt-title">🧠 投資人情緒指數</div>
+          <div style="font-size:1.8rem;font-weight:800;color:{sc_color};margin-bottom:4px;">
+            {sc:.0f} <span style="font-size:0.9rem">{sent['label']}</span>
+          </div>
+          <div class="vix-bar-bg" style="height:12px;margin-bottom:10px;">
+            <div class="vix-bar-fill" style="width:{sc:.0f}%;background:linear-gradient(90deg,#ff4444,#ffcc00,#00ee66);"></div>
+          </div>
+          {meter_rows}
+          <div style="font-size:0.68rem;color:#445566;margin-top:6px;">
+            綜合 VIX壓力(40%) + SPY動能(30%) + QQQ動能(30%)
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    with col_news_hd:
+        st.markdown('<div class="mkt-panel"><div class="mkt-title">📰 即時財經新聞</div>',
+                    unsafe_allow_html=True)
+        news = fetch_news()
+        if news:
+            news_html = ""
+            icons = {"bull": "🟢", "bear": "🔴", "neu": "⚪"}
+            for n in news:
+                icon = icons.get(n["sentiment"], "⚪")
+                cls  = f"news-{n['sentiment']}"
+                news_html += f"""
+                <div class="news-item {cls}">
+                  {icon} <a href="{n['link']}" target="_blank"
+                     style="color:#ccd6ee;text-decoration:none;">{n['title']}</a>
+                  <div class="news-src">{n['date']}</div>
+                </div>"""
+            st.markdown(news_html + "</div>", unsafe_allow_html=True)
+        else:
+            st.markdown("新聞載入中，請稍候…</div>", unsafe_allow_html=True)
+
+    # ── 第三行：市場環境警示 ──────────────────────────────────────────────
+    mkt_alerts = []
+    if vix_now > 30:
+        mkt_alerts.append(("bear", f"⚠️ VIX 極度恐慌 {vix_now:.1f}，市場波動劇烈，建議謹慎操作"))
+    elif vix_now > 25:
+        mkt_alerts.append(("info", f"🟠 VIX 偏高 {vix_now:.1f}，市場情緒緊張"))
+    elif vix_now < 13:
+        mkt_alerts.append(("bull", f"😴 VIX 超低 {vix_now:.1f}，市場過於平靜，注意突發反轉"))
+
+    spy_d = mkt.get("spy", {})
+    if spy_d and spy_d.get("pct", 0) < -2:
+        mkt_alerts.append(("bear", f"📉 SPY 單日下跌 {spy_d['pct']:.2f}%，大盤走弱"))
+    elif spy_d and spy_d.get("pct", 0) > 1.5:
+        mkt_alerts.append(("bull", f"📈 SPY 單日上漲 {spy_d['pct']:.2f}%，大盤強勢"))
+
+    qqq_d = mkt.get("qqq", {})
+    if qqq_d and qqq_d.get("pct", 0) < -2.5:
+        mkt_alerts.append(("bear", f"📉 QQQ 科技股大跌 {qqq_d['pct']:.2f}%"))
+
+    tnx_d = mkt.get("tnx", {})
+    if tnx_d and tnx_d.get("last", 0) > 4.8:
+        mkt_alerts.append(("bear", f"💸 10年期美債殖利率 {tnx_d['last']:.2f}%，利率壓力大"))
+
+    if mkt_alerts:
+        alert_cls = {"bull":"alert-bull","bear":"alert-bear","info":"alert-info","vol":"alert-vol"}
+        html_parts = [f'<div class="alert-box {alert_cls.get(t,"alert-info")}">🌐 市場環境　{msg}</div>'
+                      for t, msg in mkt_alerts]
+        st.markdown("".join(html_parts), unsafe_allow_html=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Telegram
+# ══════════════════════════════════════════════════════════════════════════════
+def send_telegram(msg: str):
+    try:
+        token   = st.secrets["TELEGRAM_BOT_TOKEN"]
+        chat_id = st.secrets["TELEGRAM_CHAT_ID"]
+        requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            data={"chat_id": chat_id, "text": msg, "parse_mode": "HTML"}, timeout=5,
+        )
+    except Exception:
+        pass
+
+def add_alert(symbol: str, period: str, msg: str, atype: str = "info"):
+    now = datetime.now().strftime("%H:%M:%S")
+    key = f"{symbol}|{period}|{msg}"
+    if key not in st.session_state.sent_alerts:
+        st.session_state.alert_log.insert(0,
+            {"時間": now, "股票": symbol, "週期": period, "訊息": msg, "類型": atype})
+        st.session_state.alert_log = st.session_state.alert_log[:200]
+        st.session_state.sent_alerts.add(key)
+        send_telegram(f"📊 [{symbol} {period}] {msg}")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 數據抓取
+# ══════════════════════════════════════════════════════════════════════════════
+@st.cache_data(ttl=60)
+def fetch_data(symbol: str, interval: str) -> pd.DataFrame:
+    _, period = INTERVAL_MAP[interval]
+    try:
+        df = yf.download(symbol, period=period, interval=interval,
+                         auto_adjust=True, progress=False)
+        if df.empty:
+            return pd.DataFrame()
+        df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+        df.dropna(inplace=True)
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 技術指標
+# ══════════════════════════════════════════════════════════════════════════════
+def calc_ema(s, n):  return s.ewm(span=n, adjust=False).mean()
+def calc_ma(s, n):   return s.rolling(n).mean()
+
+def calc_macd(s, fast=12, slow=26, sig=9):
+    dif  = calc_ema(s, fast) - calc_ema(s, slow)
+    dea  = calc_ema(dif, sig)
+    return dif, dea, (dif - dea) * 2
+
+def calc_pivot(df, interval: str = "1d"):
+    """
+    依週期動態調整掃描參數，並用「價格合理範圍過濾（±30%）」
+    確保阻力/支撐位一定在當前價格附近，不出現歷史舊極值。
+    """
+    # 依週期決定 left、right、掃描的最近 N 根 K 線
+    pivot_cfg = {
+        "1m":  (3, 3, 120),
+        "5m":  (3, 3, 100),
+        "15m": (3, 3, 80),
+        "30m": (3, 3, 60),
+        "1d":  (5, 5, 60),
+        "1wk": (3, 3, 40),
+        "1mo": (2, 2, 24),   # 月K只看近24根(2年)，避免抓到5年前低點
+    }
+    left, right, tail_n = pivot_cfg.get(interval, (3, 3, 60))
+
+    sub = df.tail(tail_n)
+    if len(sub) < left + right + 2:
+        return [], []
+
+    hi, lo, idx = sub["High"].values, sub["Low"].values, sub.index
+    current_price = float(df["Close"].iloc[-1])
+
+    # 只接受距離當前價格 ±30% 以內的 pivot（過濾歷史遠古價位）
+    price_lo = current_price * 0.70
+    price_hi = current_price * 1.30
+
+    highs, lows = [], []
+    for i in range(left, len(sub) - right):
+        if hi[i] == max(hi[i-left:i+right+1]) and price_lo <= hi[i] <= price_hi:
+            highs.append((idx[i], float(hi[i])))
+        if lo[i] == min(lo[i-left:i+right+1]) and price_lo <= lo[i] <= price_hi:
+            lows.append((idx[i], float(lo[i])))
+
+    return highs, lows
+
+def detect_trend(df) -> str:
+    if len(df) < 60: return "盤整"
+    c = df["Close"]
+    e5, e20, e60 = calc_ema(c,5).iloc[-1], calc_ema(c,20).iloc[-1], calc_ema(c,60).iloc[-1]
+    e200 = calc_ema(c,200).iloc[-1] if len(df) >= 200 else None
+    if e200:
+        if e5>e20>e60>e200: return "多頭"
+        if e5<e20<e60<e200: return "空頭"
+    else:
+        if e5>e20>e60: return "多頭"
+        if e5<e20<e60: return "空頭"
+    return "盤整"
+
+def get_macd_signal(df) -> str:
+    if len(df) < 30: return "—"
+    dif, dea, _ = calc_macd(df["Close"])
+    if dif.iloc[-1] > dea.iloc[-1] and dif.iloc[-2] <= dea.iloc[-2]: return "⬆金叉"
+    if dif.iloc[-1] < dea.iloc[-1] and dif.iloc[-2] >= dea.iloc[-2]: return "⬇死叉"
+    return "DIF↑" if dif.iloc[-1] > dea.iloc[-1] else "DIF↓"
+
+def get_ema_signal(df) -> str:
+    if len(df) < 20: return "—"
+    c = df["Close"]
+    e5, e20 = calc_ema(c,5), calc_ema(c,20)
+    if e5.iloc[-1] > e20.iloc[-1] and e5.iloc[-2] <= e20.iloc[-2]: return "多排↑"
+    if e5.iloc[-1] < e20.iloc[-1] and e5.iloc[-2] >= e20.iloc[-2]: return "空排↓"
+    return "EMA↑" if e5.iloc[-1] > e20.iloc[-1] else "EMA↓"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 警示邏輯
+# ══════════════════════════════════════════════════════════════════════════════
+def run_alerts(symbol, period_label, df):
+    if len(df) < 30: return
+    close, vol = df["Close"], df["Volume"]
+
+    dif, dea, _ = calc_macd(close)
+    if dif.iloc[-1] > dea.iloc[-1] and dif.iloc[-2] <= dea.iloc[-2]:
+        add_alert(symbol, period_label, "MACD 金叉 🟢", "bull")
+    if dif.iloc[-1] < dea.iloc[-1] and dif.iloc[-2] >= dea.iloc[-2]:
+        add_alert(symbol, period_label, "MACD 死叉 🔴", "bear")
+
+    e5, e20 = calc_ema(close,5), calc_ema(close,20)
+    if e5.iloc[-1] > e20.iloc[-1] and e5.iloc[-2] <= e20.iloc[-2]:
+        add_alert(symbol, period_label, "EMA5 上穿 EMA20 ⬆️", "bull")
+    if e5.iloc[-1] < e20.iloc[-1] and e5.iloc[-2] >= e20.iloc[-2]:
+        add_alert(symbol, period_label, "EMA5 下穿 EMA20 ⬇️", "bear")
+
+    emas = [calc_ema(close,n).iloc[-1] for n,_ in EMA_CONFIGS]
+    if all(emas[i] > emas[i+1] for i in range(len(emas)-1)):
+        add_alert(symbol, period_label, "所有 EMA 多頭排列 🚀", "bull")
+
+    vol_ma5 = vol.rolling(5).mean().iloc[-1]
+    if vol.iloc[-1] > vol_ma5 * 2:
+        add_alert(symbol, period_label, f"成交量暴增 {vol.iloc[-1]/vol_ma5:.1f}x 均量 📊", "vol")
+
+    # 支撐/阻力突破警示（含週期參數 + 價格合理性過濾）
+    itvl_key = {v[0]: k for k, v in INTERVAL_MAP.items()}.get(period_label, "1d")
+    pivots_h, pivots_l = calc_pivot(df, interval=itvl_key)
+    price      = float(close.iloc[-1])
+    prev_price = float(close.iloc[-2]) if len(close) > 1 else price
+
+    if pivots_h:
+        # 取「剛被突破」的阻力位：prev <= resist < price（由下往上突破）
+        broken = [p[1] for p in pivots_h if prev_price <= p[1] < price]
+        if broken:
+            add_alert(symbol, period_label, f"突破阻力位 ${max(broken):.2f} ⚡", "bull")
+
+    if pivots_l:
+        # 取「剛被跌破」的支撐位：price < support <= prev（由上往下跌破）
+        broken = [p[1] for p in pivots_l if price < p[1] <= prev_price]
+        if broken:
+            add_alert(symbol, period_label, f"跌破支撐位 ${min(broken):.2f} ⚠️", "bear")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 建立 K 線圖
+# ══════════════════════════════════════════════════════════════════════════════
+def build_chart(symbol, df, interval_label, compact=False, max_bars=90):
+    if df.empty: return None
+
+    # ── 限制最多顯示 90 根 K 線，避免圖表擁擠 ──
+    # EMA/MACD 用完整數據計算（保留歷史），再截取最後 90 根顯示
+    MAX_BARS = max(10, int(max_bars))   # 使用者自訂，最少10根
+    close_full, vol_full = df["Close"], df["Volume"]
+    ema_s_full = {n: calc_ema(close_full, n) for n, _ in EMA_CONFIGS}
+    ma_s_full  = {n: calc_ma(close_full,  n) for n, _, _ in MA_CONFIGS}
+    dif_full, dea_full, hist_full = calc_macd(close_full)
+
+    # 截取最後 90 根用於繪圖
+    df   = df.tail(MAX_BARS).copy()
+    close, vol = df["Close"], df["Volume"]
+    ema_s = {n: s.tail(MAX_BARS) for n, s in ema_s_full.items()}
+    ma_s  = {n: s.tail(MAX_BARS) for n, s in ma_s_full.items()}
+    dif   = dif_full.tail(MAX_BARS)
+    dea   = dea_full.tail(MAX_BARS)
+    hist  = hist_full.tail(MAX_BARS)
+
+    # 支撐阻力用截取後的資料
+    itvl_code = {v[0]: k for k, v in INTERVAL_MAP.items()}.get(interval_label, "1d")
+    pivots_h, pivots_l = calc_pivot(df, interval=itvl_code)
+
+    # ── 消除休市空白：把 DatetimeIndex 轉成字串當 category label ──────────
+    # Plotly category 軸只顯示實際存在的類別，自動跳過休市間隙
+    intraday = interval_label in {"1分鐘","5分鐘","15分鐘","30分鐘"}
+    fmt = "%m/%d %H:%M" if intraday else "%y/%m/%d"
+    xlabels = [t.strftime(fmt) for t in df.index]
+    # 所有 series 也配對成同樣的字串 index，確保對齊
+    vol_ma5 = vol.rolling(5).mean()
+
+    chart_h = 520 if compact else 820
+    fig = make_subplots(
+        rows=3, cols=1, shared_xaxes=True,
+        row_heights=[0.56, 0.19, 0.25], vertical_spacing=0.02,
+        subplot_titles=(f"{symbol} ({interval_label})", "成交量", "MACD"),
+    )
+    ann_size = 11 if compact else 13
+    for ann in fig.layout.annotations:
+        ann.font.size  = ann_size
+        ann.font.color = "#ccddee"
+
+    # K 線
+    fig.add_trace(go.Candlestick(
+        x=xlabels, open=df["Open"], high=df["High"], low=df["Low"], close=close,
+        increasing_line_color="#00cc44", increasing_fillcolor="#00cc44",
+        decreasing_line_color="#ff4444", decreasing_fillcolor="#ff4444",
+        name="K線", showlegend=False,
+    ), row=1, col=1)
+
+    # EMA 線
+    for n, color in EMA_CONFIGS:
+        fig.add_trace(go.Scatter(
+            x=xlabels, y=ema_s[n],
+            line=dict(color=color, width=1.3), name=f"EMA{n}", opacity=0.9,
+        ), row=1, col=1)
+
+    # MA 線
+    for n, color, dash in MA_CONFIGS:
+        fig.add_trace(go.Scatter(
+            x=xlabels, y=ma_s[n],
+            line=dict(color=color, width=1.8, dash=dash), name=f"MA{n}",
+        ), row=1, col=1)
+
+    # 支撐阻力
+    if pivots_h:
+        r = max(p[1] for p in pivots_h)
+        fig.add_hline(y=r, line=dict(color="#ff8888", dash="dash", width=1.5),
+                      annotation_text=f"阻力 {r:.2f}",
+                      annotation_font=dict(size=12, color="#ff8888"),
+                      annotation_bgcolor="rgba(30,10,10,0.8)", row=1, col=1)
+    if pivots_l:
+        s = min(p[1] for p in pivots_l)
+        fig.add_hline(y=s, line=dict(color="#88ff88", dash="dash", width=1.5),
+                      annotation_text=f"支撐 {s:.2f}",
+                      annotation_font=dict(size=12, color="#88ff88"),
+                      annotation_bgcolor="rgba(10,30,10,0.8)", row=1, col=1)
+
+    # 最高最低
+    max_pos = int(df["High"].values.argmax())
+    min_pos = int(df["Low"].values.argmin())
+    fig.add_annotation(x=xlabels[max_pos], y=float(df["High"].max()),
+        text=f"▲ {df['High'].max():.2f}", showarrow=True,
+        arrowhead=2, arrowcolor="#ff4444", arrowwidth=2,
+        font=dict(color="#ff8888", size=11, family="Arial Black"),
+        bgcolor="rgba(30,10,10,0.85)", bordercolor="#ff4444", borderwidth=1,
+        row=1, col=1)
+    fig.add_annotation(x=xlabels[min_pos], y=float(df["Low"].min()),
+        text=f"▼ {df['Low'].min():.2f}", showarrow=True,
+        arrowhead=2, arrowcolor="#ff4444", arrowwidth=2,
+        font=dict(color="#ff8888", size=11, family="Arial Black"),
+        bgcolor="rgba(30,10,10,0.85)", bordercolor="#ff4444", borderwidth=1,
+        row=1, col=1)
+
+    # ── 成交量 ──────────────────────────────────────────────────────────────
+    col_vol = ["#00cc44" if c >= o else "#ff4444"
+               for c, o in zip(df["Close"], df["Open"])]
+    fig.add_trace(go.Bar(x=xlabels, y=vol, marker_color=col_vol,
+                         name="成交量", showlegend=False), row=2, col=1)
+    vol_ma5 = vol.rolling(5).mean()
+    fig.add_trace(go.Scatter(x=xlabels, y=vol_ma5,
+                              line=dict(color="#ffaa00", width=1.5), name="VOL MA5"), row=2, col=1)
+
+    # 異常放量：只標記「最顯著的幾根」，用柱子邊框高亮 + 頂部小鑽石
+    # 策略：同一段密集放量只取最大的那根，避免連續出現滿屏標注
+    anomaly_mask = (vol > vol_ma5 * 2).values
+    if anomaly_mask.any():
+        # 把連續異常段落找出來，每段只取量最大的那根
+        groups, in_group, g_start = [], False, 0
+        for i, flag in enumerate(anomaly_mask):
+            if flag and not in_group:
+                in_group, g_start = True, i
+            elif not flag and in_group:
+                groups.append((g_start, i - 1))
+                in_group = False
+        if in_group:
+            groups.append((g_start, len(anomaly_mask) - 1))
+
+        # 每段取量最大的 bar 的 integer position
+        rep_pos = []
+        for g0, g1 in groups:
+            seg_vals = vol.values[g0:g1+1]
+            rep_pos.append(g0 + int(seg_vals.argmax()))
+
+        rep_x    = [xlabels[p]  for p in rep_pos]
+        rep_vol  = [float(vol.values[p])    for p in rep_pos]
+        rep_ma   = [float(vol_ma5.values[p]) if not np.isnan(vol_ma5.values[p]) else 1
+                    for p in rep_pos]
+        mult_txt = [f"異常放量 {v/max(m,1):.1f}x 均量"
+                    for v, m in zip(rep_vol, rep_ma)]
+
+        # 柱頂鑽石標記（不加擁擠文字，hover 查看倍數）
+        fig.add_trace(go.Scatter(
+            x=rep_x, y=rep_vol,
+            mode="markers",
+            marker=dict(color="#ff00ff", size=11, symbol="diamond",
+                        line=dict(color="#ffffff", width=1.2)),
+            name="異常放量",
+            hovertext=mult_txt,
+            hoverinfo="text+x",
+        ), row=2, col=1)
+
+    # ── MACD ────────────────────────────────────────────────────────────────
+    bar_col = ["#ff4444" if v >= 0 else "#00cc44" for v in hist]
+    fig.add_trace(go.Bar(x=xlabels, y=hist, marker_color=bar_col,
+                         name="MACD柱", showlegend=False), row=3, col=1)
+    fig.add_trace(go.Scatter(x=xlabels, y=dif,
+                              line=dict(color="#ffaa00", width=1.5), name="DIF"), row=3, col=1)
+    fig.add_trace(go.Scatter(x=xlabels, y=dea,
+                              line=dict(color="#0088ff", width=1.5), name="DEA"), row=3, col=1)
+
+    # ── 金叉/死叉（智能去擁擠）────────────────────────────────────────────
+    # 收集所有原始交叉點
+    raw_crosses = []
+    for i in range(1, len(dif)):
+        if dif.iloc[i] > dea.iloc[i] and dif.iloc[i-1] <= dea.iloc[i-1]:
+            raw_crosses.append((i, "gold"))
+        elif dif.iloc[i] < dea.iloc[i] and dif.iloc[i-1] >= dea.iloc[i-1]:
+            raw_crosses.append((i, "dead"))
+
+    # 間距過濾：相鄰標注至少 min_gap 根 K 線，且同方向連發只取最新
+    total_bars = len(dif)
+    min_gap    = max(6, total_bars // 20)
+    max_labels = 3 if compact else 5
+
+    filtered, last_pos, last_type = [], -9999, None
+    for pos, ctype in reversed(raw_crosses):
+        gap_ok  = (pos - last_pos) >= min_gap or last_pos == -9999
+        diff_ok = (ctype != last_type) or last_pos == -9999
+        if gap_ok and diff_ok:
+            filtered.insert(0, (pos, ctype))
+            last_pos, last_type = pos, ctype
+        if len(filtered) >= max_labels:
+            break
+
+    # 繪製：金叉標在底部（ay 正值=往下偏移），死叉標在頂部（ay 負值=往上偏移）
+    # 固定像素偏移，不依賴 MACD 數值範圍，確保 compact/full 都清晰
+    base_px = 38 if compact else 46
+
+    for seq, (pos, ctype) in enumerate(filtered):
+        x_val  = xlabels[pos]
+        y_val  = float(dif.iloc[pos])
+        extra  = 1 + (seq % 2) * 0.45    # 偶數序號偏移更遠，水平錯開
+        if ctype == "gold":
+            ay_px  = int(base_px * extra)     # 正 = 箭頭朝上，標籤在下方
+            text   = "⬆ 金叉"
+            fcol, bgcol, bcol, acol = "#ffee55", "rgba(36,32,0,0.92)", "#bbaa00", "#ddcc00"
+        else:
+            ay_px  = -int(base_px * extra)    # 負 = 箭頭朝下，標籤在上方
+            text   = "⬇ 死叉"
+            fcol, bgcol, bcol, acol = "#ff9999", "rgba(36,0,0,0.92)", "#bb3333", "#cc4444"
+
+        fig.add_annotation(
+            x=x_val, y=y_val, text=text,
+            showarrow=True, arrowhead=2, arrowwidth=1.5,
+            ax=0, ay=ay_px,
+            arrowcolor=acol,
+            font=dict(color=fcol, size=9 if compact else 10, family="Arial Black"),
+            bgcolor=bgcol, bordercolor=bcol, borderwidth=1, borderpad=3,
+            row=3, col=1,
+        )
+
+    leg_sz = 8 if compact else 11
+
+    # ── x 軸刻度標籤：依週期選擇合適格式 ─────────────────────────────────
+    # 日K以下用日期+時間，日K及以上只用日期
+    intraday_intervals = {"1分鐘","5分鐘","15分鐘","30分鐘"}
+    if interval_label in intraday_intervals:
+        tick_fmt = "%m/%d %H:%M"
+        # 每隔幾根顯示一個刻度，避免密集
+        n_ticks  = 8
+    else:
+        tick_fmt = "%Y/%m/%d"
+        n_ticks  = 8
+
+    # 用整數位置作為 x 軸刻度位置（category 模式下 x 軸是 0,1,2,...）
+    total   = len(df)
+    step    = max(1, total // n_ticks)
+    tick_positions = list(range(0, total, step))
+    tick_labels    = [df.index[i].strftime(tick_fmt) for i in tick_positions]
+
+    fig.update_layout(
+        height=chart_h, template="plotly_dark",
+        paper_bgcolor="#0e1117", plot_bgcolor="#111520",
+        font=dict(family="Arial, sans-serif", size=10 if compact else 11, color="#ccddee"),
+        legend=dict(
+            orientation="h", yanchor="bottom", y=1.01, xanchor="left", x=0,
+            font=dict(size=leg_sz, color="#ddeeff"),
+            bgcolor="rgba(14,17,23,0.85)", bordercolor="#2e3456", borderwidth=1,
+            itemsizing="constant",
+            traceorder="normal",
+        ),
+        margin=dict(l=6, r=6, t=36 if compact else 44, b=4),
+        xaxis_rangeslider_visible=False,
+        # category 類型：plotly 只顯示有數據的 bar，自動跳過休市空白
+        xaxis_type="category",
+        xaxis2_type="category",
+        xaxis3_type="category",
+    )
+
+    # 套用自訂刻度到所有 x 軸
+    for axis_name in ["xaxis", "xaxis2", "xaxis3"]:
+        fig.update_layout(**{
+            axis_name: dict(
+                type="category",
+                showgrid=True, gridcolor="#1a1e30",
+                tickfont=dict(size=9 if compact else 10),
+                tickmode="array",
+                tickvals=tick_positions,
+                ticktext=tick_labels,
+                tickangle=-35,
+            )
+        })
+
+    fig.update_yaxes(showgrid=True, gridcolor="#1a1e30",
+                     tickfont=dict(size=9 if compact else 10))
+    return fig
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 多週期摘要列
+# ══════════════════════════════════════════════════════════════════════════════
+def render_mtf_summary(symbol, selected_intervals, show_alerts):
+    st.markdown(f'<div class="mtf-section-title">🔀 多週期總覽 — {symbol}</div>',
+                unsafe_allow_html=True)
+    rows = []
+    for itvl in selected_intervals:
+        label, _ = INTERVAL_MAP[itvl]
+        df = fetch_data(symbol, itvl)
+        if df.empty:
+            rows.append(
+                f'<div class="mtf-header"><span class="mtf-period">{label}</span>'
+                f'<span style="color:#555">數據載入失敗</span></div>')
+            continue
+
+        if show_alerts:
+            run_alerts(symbol, label, df)
+
+        close   = df["Close"]
+        last    = float(close.iloc[-1])
+        prev    = float(close.iloc[-2]) if len(close) > 1 else last
+        chg     = last - prev
+        pct     = chg / prev * 100 if prev else 0
+        hi      = float(df["High"].iloc[-1])
+        lo      = float(df["Low"].iloc[-1])
+        vol_k   = int(df["Volume"].iloc[-1]) // 10000
+
+        chg_cls   = "mtf-chg-up" if chg >= 0 else "mtf-chg-dn"
+        chg_arrow = "▲" if chg >= 0 else "▼"
+
+        trend     = detect_trend(df)
+        t_cls     = {"多頭":"mtf-trend-bull","空頭":"mtf-trend-bear","盤整":"mtf-trend-side"}[trend]
+        t_icon    = {"多頭":"▲","空頭":"▼","盤整":"◆"}[trend]
+
+        macd_s    = get_macd_signal(df)
+        macd_cls  = "mtf-macd-bull" if any(x in macd_s for x in ["金叉","↑"]) else "mtf-macd-bear"
+
+        ema_s     = get_ema_signal(df)
+        ema_cls   = "mtf-ema-bull" if any(x in ema_s for x in ["↑","多"]) else "mtf-ema-bear"
+
+        rows.append(
+            f'<div class="mtf-header">'
+            f'  <span class="mtf-period">{label}</span>'
+            f'  <div class="mtf-divider"></div>'
+            f'  <span class="mtf-price">${last:.2f}</span>'
+            f'  <span class="{chg_cls}">{chg_arrow} {chg:+.2f} ({pct:+.2f}%)</span>'
+            f'  <div class="mtf-divider"></div>'
+            f'  <span style="color:#6688aa;font-size:0.82rem">H:{hi:.2f}　L:{lo:.2f}　量:{vol_k}萬</span>'
+            f'  <div class="mtf-divider"></div>'
+            f'  <span class="{t_cls}">{t_icon} {trend}</span>'
+            f'  <div class="mtf-divider"></div>'
+            f'  <span class="{macd_cls}">MACD: {macd_s}</span>'
+            f'  <span class="{ema_cls}">EMA: {ema_s}</span>'
+            f'</div>'
+        )
+    st.markdown("".join(rows), unsafe_allow_html=True)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 多週期 K 線圖
+# ══════════════════════════════════════════════════════════════════════════════
+def render_mtf_charts(symbol, selected_intervals, layout_mode, max_bars=90):
+    if not selected_intervals:
+        st.info("請至少選擇一個時間週期")
+        return
+    st.markdown(f'<div class="mtf-section-title">📊 多週期 K 線圖 — {symbol}</div>',
+                unsafe_allow_html=True)
+
+    if layout_mode == "並排（2欄）":
+        pairs = [selected_intervals[i:i+2] for i in range(0, len(selected_intervals), 2)]
+        for pair in pairs:
+            cols = st.columns(len(pair))
+            for col, itvl in zip(cols, pair):
+                label, _ = INTERVAL_MAP[itvl]
+                df = fetch_data(symbol, itvl)
+                with col:
+                    if df.empty:
+                        st.error(f"{label} 無數據")
+                    else:
+                        fig = build_chart(symbol, df, label, compact=True, max_bars=max_bars)
+                        if fig:
+                            st.plotly_chart(fig, use_container_width=True,
+                                            config={"displayModeBar": False},
+                                            key=f"mtf_{symbol}_{itvl}")
+    else:
+        for itvl in selected_intervals:
+            label, _ = INTERVAL_MAP[itvl]
+            df = fetch_data(symbol, itvl)
+            if df.empty:
+                st.error(f"{label} 無數據")
+            else:
+                fig = build_chart(symbol, df, label, compact=False, max_bars=max_bars)
+                if fig:
+                    st.plotly_chart(fig, use_container_width=True,
+                                    config={"displayModeBar": True},
+                                    key=f"mtf_{symbol}_{itvl}_full")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 單週期渲染
+# ══════════════════════════════════════════════════════════════════════════════
+def render_single(symbol, interval, show_alerts, max_bars=90):
+    label, _ = INTERVAL_MAP[interval]
+    with st.spinner(f"載入 {symbol} {label} 數據中..."):
+        df = fetch_data(symbol, interval)
+
+    if df.empty:
+        st.error(f"❌ 無法取得 {symbol} 數據")
+        return
+
+    close   = df["Close"]
+    last    = float(close.iloc[-1])
+    prev    = float(close.iloc[-2]) if len(close) > 1 else last
+    chg     = last - prev
+    pct     = chg / prev * 100 if prev else 0
+    vol_now = int(df["Volume"].iloc[-1])
+    trend   = detect_trend(df)
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("最新價格",      f"${last:.2f}", f"{chg:+.2f} ({pct:+.2f}%)")
+    c2.metric("成交量（萬股）", f"{vol_now/10000:.1f}")
+    c3.metric("本K最高",       f"${df['High'].iloc[-1]:.2f}")
+    c4.metric("本K最低",       f"${df['Low'].iloc[-1]:.2f}")
+    t_cls  = {"多頭":"trend-bull","空頭":"trend-bear","盤整":"trend-side"}[trend]
+    t_icon = {"多頭":"▲","空頭":"▼","盤整":"◆"}[trend]
+    with c5:
+        st.markdown(
+            f'<div class="trend-card"><div class="trend-title">趨勢判斷</div>'
+            f'<div class="{t_cls}">{t_icon} {trend}</div></div>',
+            unsafe_allow_html=True)
+
+    # EMA 列
+    items = []
+    for n, color in EMA_CONFIGS:
+        val   = float(calc_ema(close,n).iloc[-1])
+        arrow = "↑" if last > val else "↓"
+        items.append(
+            f'<span class="ema-item" style="color:{color}">'
+            f'<span class="ema-label">EMA{n} </span>{val:.2f}'
+            f'<span style="font-size:0.72rem;opacity:0.6"> {arrow}</span></span>')
+    st.markdown('<div class="ema-bar">' + "".join(items) + '</div>',
+                unsafe_allow_html=True)
+
+    fig = build_chart(symbol, df, label, max_bars=max_bars)
+    if fig:
+        st.plotly_chart(fig, use_container_width=True,
+                        config={"displayModeBar": True},
+                        key=f"single_{symbol}_{interval}")
+
+    if show_alerts:
+        run_alerts(symbol, label, df)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Sidebar
+# ══════════════════════════════════════════════════════════════════════════════
+with st.sidebar:
+    st.title("📈 美股監控系統")
+    st.markdown("---")
+
+    raw_input = st.text_area("股票代號（逗號分隔）", value="TSLA,AAPL,NVDA", height=80)
+    symbols   = [s.strip().upper() for s in raw_input.replace("，",",").split(",") if s.strip()]
+
+    st.markdown("---")
+    st.markdown("#### 📅 監控模式")
+    mode = st.radio("", ["單一週期", "多週期同時監控"], horizontal=True,
+                    label_visibility="collapsed")
+
+    if mode == "單一週期":
+        single_interval = st.selectbox(
+            "時間週期",
+            ALL_INTERVALS,
+            format_func=lambda x: INTERVAL_LABELS[x],
+            index=4,
+        )
+        layout_mode = None
+        selected    = []
+
+    else:
+        st.markdown("**勾選要同時顯示的週期：**")
+        selected    = []
+        defaults    = {"5m", "15m", "1d"}
+        left_col, right_col = st.columns(2)
+        for i, itvl in enumerate(ALL_INTERVALS):
+            col = left_col if i % 2 == 0 else right_col
+            if col.checkbox(INTERVAL_LABELS[itvl], value=(itvl in defaults), key=f"cb_{itvl}"):
+                selected.append(itvl)
+        st.markdown("")
+        layout_mode = st.radio("圖表排列方式",
+                               ["並排（2欄）", "堆疊（全寬）"], horizontal=True)
+
+    st.markdown("---")
+    auto_refresh = st.toggle("自動刷新", value=False)
+    refresh_sec  = st.slider("刷新間隔（秒）", 60, 300, 60, step=30, disabled=not auto_refresh)
+
+    st.markdown("---")
+    st.markdown("**📊 K 線顯示根數**")
+    max_bars = st.number_input(
+        "每張圖最多顯示幾根 K 線",
+        min_value=20, max_value=500, value=90, step=10,
+        help="建議：分鐘圖 60-120 根，日K 60-90 根，週K/月K 40-60 根",
+    )
+
+    st.markdown("---")
+    show_alerts  = st.toggle("啟用警示偵測", value=True)
+    show_market  = st.toggle("顯示市場環境面板", value=True)
+
+    if st.button("🗑️ 清除警示記錄"):
+        st.session_state.alert_log   = []
+        st.session_state.sent_alerts = set()
+        st.toast("警示記錄已清除")
+
+    if st.session_state.alert_log:
+        csv_data = pd.DataFrame(st.session_state.alert_log).to_csv(
+            index=False, encoding="utf-8-sig")
+        st.download_button("📥 匯出警示 CSV", csv_data, "alerts.csv", "text/csv")
+
+    st.markdown("---")
+    st.caption("數據來源：Yahoo Finance\n\n⚠️ 僅供參考，不構成投資建議")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 主區域
+# ══════════════════════════════════════════════════════════════════════════════
+st.title("🇺🇸 美股即時監控系統")
+
+if not symbols:
+    st.info("請在左側輸入股票代號")
+    st.stop()
+
+# ── 市場環境面板（置頂）──────────────────────────────────────────────────────
+if show_market:
+    render_market_environment()
+    st.markdown("---")
+
+stock_tabs = st.tabs([f"📊 {s}" for s in symbols])
+
+for tab, symbol in zip(stock_tabs, symbols):
+    with tab:
+        if mode == "單一週期":
+            render_single(symbol, single_interval, show_alerts, max_bars=max_bars)
+
+        else:
+            if not selected:
+                st.warning("⚠️ 請在左側至少勾選一個時間週期")
+            else:
+                # ① 多週期摘要
+                render_mtf_summary(symbol, selected, show_alerts)
+                st.markdown("---")
+                # ② 多週期 K 線圖
+                render_mtf_charts(symbol, selected, layout_mode, max_bars=max_bars)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 警示面板
+# ══════════════════════════════════════════════════════════════════════════════
+if st.session_state.alert_log:
+    st.markdown("---")
+    st.subheader("🔔 警示訊息記錄")
+    cls_map = {"bull":"alert-bull","bear":"alert-bear","vol":"alert-vol","info":"alert-info"}
+    for e in st.session_state.alert_log[:40]:
+        cls    = cls_map.get(e["類型"], "alert-info")
+        p_tag  = f'【{e["週期"]}】' if e.get("週期") else ""
+        st.markdown(
+            f'<div class="alert-box {cls}">'
+            f'🕐 {e["時間"]}　【{e["股票"]}】{p_tag}　{e["訊息"]}'
+            f'</div>',
+            unsafe_allow_html=True)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 自動刷新
+# ══════════════════════════════════════════════════════════════════════════════
+if auto_refresh:
+    time.sleep(refresh_sec)
+    st.cache_data.clear()
+    st.rerun()
